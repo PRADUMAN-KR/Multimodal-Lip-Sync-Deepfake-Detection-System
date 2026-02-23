@@ -1,9 +1,11 @@
+import math
+import pickle
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from time import perf_counter
 
-import torch
 import numpy as np
+import torch
 from fastapi import UploadFile
 
 from ..core.logger import get_logger
@@ -46,6 +48,23 @@ class Predictor:
         chunk_stride: int = 16,
         long_video_threshold_sec: float = 2.0,
         max_total_frames: int = 900,
+        # ── Confidence Margin Rule ─────────────────────────────────────────
+        confidence_margin: float = 0.10,
+        # ── Output Calibration ────────────────────────────────────────────
+        calibration_method: str = "none",
+        calibration_temperature: float = 1.0,
+        calibration_platt_a: float = 1.0,
+        calibration_platt_b: float = 0.0,
+        calibration_isotonic_path: Optional[str] = None,
+        # ── Mouth Motion Energy Check ─────────────────────────────────────
+        mouth_motion_check: bool = True,
+        mouth_motion_low_threshold: float = 0.015,
+        mouth_motion_fake_penalty: float = 0.10,
+        audio_energy_high_threshold: float = -25.0,
+        audio_energy_low_threshold: float = -50.0,
+        # ── Sparse-real-signal guard ──────────────────────────────────────
+        weak_real_gate: float = 0.08,
+        weak_real_window_threshold: float = 0.30,
     ):
         self.device = device
         self.confidence_threshold = float(confidence_threshold)
@@ -64,6 +83,41 @@ class Predictor:
         self.long_video_threshold_sec = float(long_video_threshold_sec)
         self.max_total_frames = int(max_total_frames)
 
+        # ── Confidence Margin Rule ─────────────────────────────────────────────
+        self.confidence_margin = float(max(0.0, confidence_margin))
+
+        # ── Output Calibration ────────────────────────────────────────────────
+        _cal_allowed = {"none", "temperature", "platt", "isotonic"}
+        self._cal_method = calibration_method if calibration_method in _cal_allowed else "none"
+        self._cal_temperature = float(max(1e-3, calibration_temperature))
+        self._cal_platt_a = float(calibration_platt_a)
+        self._cal_platt_b = float(calibration_platt_b)
+        self._isotonic_cal = None
+        if self._cal_method == "isotonic" and calibration_isotonic_path:
+            try:
+                with open(calibration_isotonic_path, "rb") as _f:
+                    self._isotonic_cal = pickle.load(_f)
+                logger.info("Loaded isotonic calibrator from %s", calibration_isotonic_path)
+            except Exception:
+                logger.exception(
+                    "Failed to load isotonic calibrator from %s; disabling calibration",
+                    calibration_isotonic_path,
+                )
+                self._cal_method = "none"
+
+        # ── Mouth Motion Energy Check ──────────────────────────────────────────
+        self.mouth_motion_check_enabled = bool(mouth_motion_check)
+        self.mouth_motion_low_threshold = float(mouth_motion_low_threshold)
+        self.mouth_motion_fake_penalty = float(mouth_motion_fake_penalty)
+        self.audio_energy_high_threshold = float(audio_energy_high_threshold)
+        self.audio_energy_low_threshold = float(audio_energy_low_threshold)
+
+        # ── Sparse-real-signal guard ───────────────────────────────────────────
+        # Protects against false negatives when a long video has very low overall
+        # confidence yet at least one window shows a real-like signal.
+        self.weak_real_gate = float(max(0.0, weak_real_gate))
+        self.weak_real_window_threshold = float(max(0.0, weak_real_window_threshold))
+
         model = LipSyncModel()
 
         if not model_path.is_file():
@@ -79,10 +133,12 @@ class Predictor:
             use_torchscript,
         )
         logger.info(
-            "Multi-track selection config: uncertainty_margin=%.3f, confidence_smoothing=%s, trim_ratio=%.2f, "
-            "max_tracks=%d, refine_margin=%.3f, refine_top_k=%d, "
+            "Multi-track selection config: uncertainty_margin=%.3f, confidence_margin=%.3f, "
+            "confidence_smoothing=%s, trim_ratio=%.2f, max_tracks=%d, "
+            "refine_margin=%.3f, refine_top_k=%d, "
             "chunk_size=%d, chunk_stride=%d, long_video_threshold_sec=%.1f, max_total_frames=%d",
             self.uncertainty_margin,
+            self.confidence_margin,
             self.confidence_smoothing,
             self.trim_ratio,
             self.max_tracks,
@@ -92,6 +148,22 @@ class Predictor:
             self.chunk_stride,
             self.long_video_threshold_sec,
             self.max_total_frames,
+        )
+        logger.info(
+            "Calibration: method=%s, temperature=%.3f, platt_a=%.3f, platt_b=%.3f",
+            self._cal_method,
+            self._cal_temperature,
+            self._cal_platt_a,
+            self._cal_platt_b,
+        )
+        logger.info(
+            "Mouth motion check: enabled=%s, motion_low_threshold=%.4f, "
+            "fake_penalty=%.3f, audio_high_threshold=%.1f dB, audio_low_threshold=%.1f dB",
+            self.mouth_motion_check_enabled,
+            self.mouth_motion_low_threshold,
+            self.mouth_motion_fake_penalty,
+            self.audio_energy_high_threshold,
+            self.audio_energy_low_threshold,
         )
         logger.info("Loading lip-sync model weights from %s", model_path)
         state = torch.load(model_path, map_location=device, weights_only=False)
@@ -120,7 +192,7 @@ class Predictor:
         self.model = model
 
     def _infer_confidence(self, visual_np: np.ndarray, audio_np: np.ndarray) -> float:
-        """Run a single forward pass and return P(REAL) confidence."""
+        """Run a single forward pass, apply output calibration, return P(REAL)."""
         visual_tensor = torch.from_numpy(visual_np).unsqueeze(0)
         audio_tensor = torch.from_numpy(audio_np).unsqueeze(0)
 
@@ -131,6 +203,26 @@ class Predictor:
         visual_tensor = visual_tensor.to(self.device)
         audio_tensor = audio_tensor.to(self.device)
         logits = self.model(visual_tensor, audio_tensor)
+        logit_val = float(logits.item())
+
+        # ── Output calibration ─────────────────────────────────────────────
+        # Temperature scaling: divides logit by T before sigmoid.
+        #   T > 1  → softer (less overconfident), T < 1 → sharper.
+        if self._cal_method == "temperature":
+            logit_cal = logit_val / self._cal_temperature
+            return float(torch.sigmoid(torch.tensor(logit_cal)).item())
+
+        # Platt scaling: affine transform of logit before sigmoid.
+        if self._cal_method == "platt":
+            logit_cal = self._cal_platt_a * logit_val + self._cal_platt_b
+            return float(torch.sigmoid(torch.tensor(logit_cal)).item())
+
+        # Isotonic regression: monotone mapping on the raw probability.
+        if self._cal_method == "isotonic" and self._isotonic_cal is not None:
+            raw_prob = float(torch.sigmoid(logits).item())
+            cal_prob = float(self._isotonic_cal.predict([[raw_prob]])[0])
+            return float(np.clip(cal_prob, 0.0, 1.0))
+
         return float(torch.sigmoid(logits).item())
 
     def _robust_confidence(self, confidences: List[float]) -> float:
@@ -259,6 +351,159 @@ class Predictor:
             return 0.5
         return float(np.clip((corr + 1.0) * 0.5, 0.0, 1.0))
 
+    # ── Mouth Motion Energy Check ─────────────────────────────────────────────
+
+    def _mouth_motion_energy_check(
+        self, visual_np: np.ndarray, audio_np: np.ndarray
+    ) -> Dict[str, Any]:
+        """Check for mismatch between audio loudness and mouth region motion.
+
+        Uses the lower half of the face crop as a proxy for the mouth area.
+
+        Returns a dict with:
+          - ``audio_energy``       – mean mel-dB of the audio (higher = louder; max = 0).
+          - ``mouth_motion_energy``– mean abs frame-diff in the lower face region.
+          - ``check_result``       – ``'likely_fake'``, ``'uncertain'``, or ``'no_issue'``.
+
+        Decision logic:
+          - ``likely_fake``  : audio is loud  **and** mouth barely moves.
+          - ``uncertain``    : audio is silent **and** mouth barely moves
+                               (no information → don't predict fake).
+          - ``no_issue``     : normal activity.
+        """
+        frames = visual_np.mean(axis=0)       # (T, H, W)
+        H = int(frames.shape[1])
+        mouth_frames = frames[:, H // 2 :, :] # lower face ≈ mouth region
+
+        if mouth_frames.shape[0] < 2:
+            return {"audio_energy": 0.0, "mouth_motion_energy": 0.0, "check_result": "no_issue"}
+
+        motion = float(np.abs(np.diff(mouth_frames, axis=0)).mean())
+        audio_energy = float(audio_np[0].mean())  # mean mel-dB
+
+        if (
+            audio_energy > self.audio_energy_high_threshold
+            and motion < self.mouth_motion_low_threshold
+        ):
+            check_result = "likely_fake"
+        elif (
+            audio_energy < self.audio_energy_low_threshold
+            and motion < self.mouth_motion_low_threshold
+        ):
+            check_result = "uncertain"
+        else:
+            check_result = "no_issue"
+
+        return {
+            "audio_energy": round(audio_energy, 4),
+            "mouth_motion_energy": round(motion, 6),
+            "check_result": check_result,
+        }
+
+    def _apply_mouth_motion_check(
+        self, visual_np: np.ndarray, audio_np: np.ndarray, confidence: float
+    ) -> Tuple[float, Dict[str, Any]]:
+        """Run the mouth motion check and optionally adjust the final confidence.
+
+        - ``likely_fake``  → reduce P(REAL) by ``mouth_motion_fake_penalty``.
+        - ``uncertain``    → if model would predict *fake*, override to real
+                             (confidence lifted to threshold).
+
+        Returns ``(adjusted_confidence, check_result_dict)``.
+        """
+        if not self.mouth_motion_check_enabled:
+            return confidence, {"check_result": "disabled"}
+
+        check = self._mouth_motion_energy_check(visual_np, audio_np)
+        adjusted = confidence
+
+        if check["check_result"] == "likely_fake":
+            adjusted = float(max(0.0, confidence - self.mouth_motion_fake_penalty))
+            logger.info(
+                "Mouth motion check → likely_fake "
+                "(audio=%.1f dB, motion=%.5f). Confidence: %.4f → %.4f",
+                check["audio_energy"],
+                check["mouth_motion_energy"],
+                confidence,
+                adjusted,
+            )
+        elif check["check_result"] == "uncertain":
+            if confidence < self.confidence_threshold:
+                adjusted = float(self.confidence_threshold)
+                logger.info(
+                    "Mouth motion check → uncertain "
+                    "(audio=%.1f dB, motion=%.5f). "
+                    "Fake prediction overridden to real (%.4f → %.4f)",
+                    check["audio_energy"],
+                    check["mouth_motion_energy"],
+                    confidence,
+                    adjusted,
+                )
+
+        return adjusted, check
+
+    def _aggregate_mouth_motion_check(
+        self,
+        chunks: List[np.ndarray],
+        chunk_starts: List[int],
+        audio_np_full: np.ndarray,
+        total_v_frames: int,
+        max_samples: int = 5,
+    ) -> Dict[str, Any]:
+        """Multi-window mouth motion check for long videos.
+
+        Samples up to ``max_samples`` evenly-spaced chunks across the full track,
+        runs ``_mouth_motion_energy_check`` on each, and returns an aggregated
+        result using majority voting (with ``'uncertain'`` requiring only a
+        simple majority to be conservative).
+
+        This is more robust than checking only the first chunk because a 14-second
+        video that is quiet throughout will show consistent low-motion + quiet-audio
+        across multiple windows, reliably triggering the "uncertain" guard.
+        """
+        n = len(chunks)
+        if n == 0:
+            return {"check_result": "no_data", "audio_energy": 0.0, "mouth_motion_energy": 0.0, "samples_checked": 0}
+
+        if n <= max_samples:
+            indices = list(range(n))
+        else:
+            step = n / max_samples
+            indices = [int(i * step) for i in range(max_samples)]
+            # Always include last chunk
+            if (n - 1) not in indices:
+                indices[-1] = n - 1
+
+        counts: Dict[str, int] = {"likely_fake": 0, "uncertain": 0, "no_issue": 0}
+        audio_energies: List[float] = []
+        motions: List[float] = []
+
+        for idx in indices:
+            audio_chunk = self._align_audio_chunk(
+                audio_np_full, int(chunk_starts[idx]), total_v_frames
+            )
+            check = self._mouth_motion_energy_check(chunks[idx], audio_chunk)
+            counts[check["check_result"]] = counts.get(check["check_result"], 0) + 1
+            audio_energies.append(float(check["audio_energy"]))
+            motions.append(float(check["mouth_motion_energy"]))
+
+        n_samples = len(indices)
+        # "uncertain" wins if it holds in more than half the samples (conservative).
+        if counts["uncertain"] > n_samples // 2:
+            agg_result = "uncertain"
+        elif counts["likely_fake"] > counts["uncertain"] + counts["no_issue"]:
+            agg_result = "likely_fake"
+        else:
+            agg_result = "no_issue"
+
+        return {
+            "check_result": agg_result,
+            "audio_energy": round(float(np.median(audio_energies)), 4),
+            "mouth_motion_energy": round(float(np.median(motions)), 6),
+            "samples_checked": n_samples,
+            "counts": counts,
+        }
+
     def _align_audio_chunk(
         self,
         audio_np_full: np.ndarray,
@@ -371,8 +616,9 @@ class Predictor:
         if not chunked_tracks:
             logger.warning("No tracks found in long video; returning uncertain result.")
             return {
+                "verdict": "uncertain",
                 "is_real": False,
-                "is_fake": True,
+                "is_fake": False,
                 "confidence": 0.5,
                 "manipulation_probability": 0.5,
                 "tracks": None,
@@ -383,7 +629,7 @@ class Predictor:
                 "speaking_real_count": 0,
                 "speaking_fake_count": 0,
                 "verdicts": {
-                    "active_speaker_policy_is_fake": True,
+                    "active_speaker_policy_is_fake": False,
                     "any_speaking_fake_policy_is_fake": False,
                     "all_speaking_fake_policy_is_fake": False,
                     "majority_speaking_fake_policy_is_fake": False,
@@ -460,6 +706,18 @@ class Predictor:
             if len(sorted_tracks) > 1 else 1.0
         )
         selection_uncertain = selection_margin < self.uncertainty_margin
+
+        # ── Confidence Margin Rule ─────────────────────────────────────────────
+        # Flag uncertain when top-2 raw confidence scores are very close,
+        # independent of the composite selection score.
+        if len(sorted_tracks) > 1:
+            _conf_gap = abs(
+                sorted_tracks[0]["confidence"] - sorted_tracks[1]["confidence"]
+            )
+            confidence_margin_uncertain = _conf_gap < self.confidence_margin
+        else:
+            _conf_gap = 1.0
+            confidence_margin_uncertain = False
 
         # ── Per-chunk timeline across full clip ───────────────────────────────
         # For each chunk index shared across tracks, pick the winner
@@ -587,6 +845,25 @@ class Predictor:
         )
         mixed_window_signal = strong_real >= 2 and strong_fake >= 2
 
+        # ── Temporal confidence drift ──────────────────────────────────────────
+        # Split windows into first-half and second-half; flag when confidence
+        # drops significantly in the second half.  This catches partially-
+        # manipulated clips (e.g. the first 18 s are real, the last 12 s are
+        # spliced with a deepfake) without changing the overall verdict.
+        _n_w = len(conf_arr)
+        if _n_w >= 4:
+            _half = _n_w // 2
+            _first_half_avg = float(conf_arr[:_half].mean())
+            _second_half_avg = float(conf_arr[_half:].mean())
+            _temporal_drift = round(_first_half_avg - _second_half_avg, 4)
+            # Alert when the second half is 0.20+ lower on average.
+            temporal_confidence_drop = bool(_temporal_drift >= 0.20)
+        else:
+            _first_half_avg = float(conf_arr.mean())
+            _second_half_avg = float(conf_arr.mean())
+            _temporal_drift = 0.0
+            temporal_confidence_drop = False
+
         speech_mask = speech_arr >= 0.45
         vote_src = conf_arr[speech_mask] if np.any(speech_mask) else conf_arr
         fake_vote_ratio = float(np.mean(vote_src < self.confidence_threshold)) if vote_src.size else 1.0
@@ -642,6 +919,88 @@ class Predictor:
         else:
             verdicts = track_policy_verdicts
 
+        # ── Sparse-real-signal guard ───────────────────────────────────────────
+        # If the overall confidence is extremely low (model almost certain fake)
+        # but at least one window has a notable real-like signal, the verdict is
+        # likely a calibration artifact or a quiet/still-face false negative.
+        # Conservative action: treat as uncertain (lift to threshold).
+        _max_window_conf = float(max(window_confs)) if window_confs else 0.0
+        sparse_real_guard_applied = False
+        _conf_before_sparse = final_confidence  # safe default (may be overwritten)
+        override_reason: Optional[str] = None
+        if (
+            not final_is_real
+            and _max_window_conf >= self.weak_real_window_threshold
+            and final_confidence < self.weak_real_gate
+        ):
+            _conf_before_sparse = final_confidence
+            sparse_real_guard_applied = True
+            selection_uncertain = True
+            override_reason = "sparse_real_signal"
+            final_confidence = float(self.confidence_threshold)
+            final_is_real = True
+            # Align speaker_case and verdicts with the conservative decision.
+            speaker_case = "uncertain_override_sparse_real"
+            verdicts = {k: False for k in verdicts}
+            logger.info(
+                "Sparse-real-signal guard triggered: "
+                "max_window_conf=%.3f ≥ threshold=%.3f, final_conf was %.4f → lifted to %.4f",
+                _max_window_conf,
+                self.weak_real_window_threshold,
+                _conf_before_sparse,
+                final_confidence,
+            )
+
+        # ── Multi-window Mouth Motion Energy Check ─────────────────────────────
+        # Sample up to 5 evenly-spaced chunks from the best track so that a
+        # consistently quiet/still long video is reliably detected as "uncertain"
+        # rather than relying on the first chunk only.
+        mouth_check: Dict[str, Any] = {"check_result": "no_data"}
+        mouth_motion_override_applied = False
+        _conf_before_mm = final_confidence  # safe default (may be overwritten)
+        _best_track_obj = next(
+            (tr for tr in chunked_tracks if int(tr["track_id"]) == best_track_id), None
+        )
+        if _best_track_obj and _best_track_obj.get("chunks"):
+            mouth_check = self._aggregate_mouth_motion_check(
+                _best_track_obj["chunks"],
+                _best_track_obj["chunk_starts"],
+                audio_np_full,
+                total_v_frames,
+            )
+            prev_conf = final_confidence
+            if mouth_check["check_result"] == "likely_fake" and self.mouth_motion_check_enabled:
+                final_confidence = float(max(0.0, final_confidence - self.mouth_motion_fake_penalty))
+                logger.info(
+                    "Multi-window mouth check → likely_fake "
+                    "(median audio=%.1f dB, median motion=%.5f, %d/%d samples). "
+                    "Confidence: %.4f → %.4f",
+                    mouth_check["audio_energy"], mouth_check["mouth_motion_energy"],
+                    mouth_check.get("counts", {}).get("likely_fake", 0),
+                    mouth_check.get("samples_checked", 1),
+                    prev_conf, final_confidence,
+                )
+            elif mouth_check["check_result"] == "uncertain" and self.mouth_motion_check_enabled:
+                if final_confidence < self.confidence_threshold:
+                    _conf_before_mm = final_confidence
+                    mouth_motion_override_applied = True
+                    selection_uncertain = True
+                    override_reason = override_reason or "mouth_motion_uncertain"
+                    final_confidence = float(self.confidence_threshold)
+                    # Align speaker_case and verdicts with the conservative decision.
+                    speaker_case = "uncertain_override_mouth_motion"
+                    verdicts = {k: False for k in verdicts}
+                    logger.info(
+                        "Multi-window mouth check → uncertain "
+                        "(median audio=%.1f dB, median motion=%.5f, %d/%d samples). "
+                        "Fake prediction overridden to real (%.4f → %.4f)",
+                        mouth_check["audio_energy"], mouth_check["mouth_motion_energy"],
+                        mouth_check.get("counts", {}).get("uncertain", 0),
+                        mouth_check.get("samples_checked", 1),
+                        _conf_before_mm, final_confidence,
+                    )
+            final_is_real = final_confidence >= self.confidence_threshold
+
         t_end = perf_counter()
         logger.info(
             "Long-video inference done: tracks=%d, chunks_per_track_max=%d, "
@@ -663,6 +1022,7 @@ class Predictor:
         )
 
         # ── Build detail message ──────────────────────────────────────────────
+        dur_str = f"{total_v_frames/max(1.0,fps):.1f}s"
         if turn_taking_detected:
             spans_str = " → ".join(
                 f"track_{seg['selected_track_id']} "
@@ -670,32 +1030,58 @@ class Predictor:
                 for seg in speaker_timeline
             )
             detail = (
-                f"Long video ({total_v_frames/max(1.0,fps):.1f}s, {max_chunks} chunks analyzed). "
+                f"Long video ({dur_str}, {max_chunks} chunks analyzed). "
                 f"Speaker turn-taking detected: {spans_str}. "
                 f"Final verdict window-aggregated (confidence={final_confidence:.4f})."
             )
             selection_uncertain = False
+        elif mouth_motion_override_applied:
+            detail = (
+                f"Long video ({dur_str}, {max_chunks} chunks). "
+                f"Mouth motion check → uncertain "
+                f"(audio={mouth_check['audio_energy']:.1f} dB, "
+                f"motion={mouth_check['mouth_motion_energy']:.5f}): "
+                f"quiet audio + near-zero mouth motion — cannot distinguish fake from natural still speech. "
+                f"Conservative REAL verdict returned (raw model conf={_conf_before_mm:.4f}, "
+                f"lifted to threshold={final_confidence:.4f})."
+            )
+        elif sparse_real_guard_applied:
+            detail = (
+                f"Long video ({dur_str}, {max_chunks} chunks). "
+                f"Sparse-real-signal guard: model confidence very low ({_conf_before_sparse:.4f}) "
+                f"but window {int(np.argmax(window_confs))} showed real-like signal "
+                f"(conf={_max_window_conf:.3f}). "
+                f"Conservative REAL verdict (lifted to threshold={final_confidence:.4f})."
+            )
         elif window_consensus_uncertain:
             detail = (
-                f"Long video ({total_v_frames/max(1.0,fps):.1f}s, {max_chunks} chunks). "
+                f"Long video ({dur_str}, {max_chunks} chunks). "
                 f"Window consensus is mixed (strong_real={strong_real}, strong_fake={strong_fake}, "
                 f"fake_vote_ratio={fake_vote_ratio:.2f}). "
                 f"Returning conservative REAL verdict (confidence={final_confidence:.4f})."
             )
         elif selection_uncertain:
             detail = (
-                f"Long video ({total_v_frames/max(1.0,fps):.1f}s, {max_chunks} chunks). "
+                f"Long video ({dur_str}, {max_chunks} chunks). "
                 f"Track selection uncertain (margin={selection_margin:.4f})."
             )
         else:
+            _drift_note = (
+                f" ⚠ Temporal drift detected: first-half avg={_first_half_avg:.3f}, "
+                f"second-half avg={_second_half_avg:.3f} (drop={_temporal_drift:.3f})."
+                if temporal_confidence_drop else ""
+            )
             detail = (
-                f"Long video ({total_v_frames/max(1.0,fps):.1f}s). "
+                f"Long video ({dur_str}). "
                 f"Analyzed {max_chunks} chunk(s) across full clip. "
                 f"Dominant speaker: track {best_track_id} "
-                f"(confidence={final_confidence:.4f})."
+                f"(confidence={final_confidence:.4f}).{_drift_note}"
             )
 
+        # When an override was applied we return uncertain so clients don't treat as confident.
+        _verdict: str = "uncertain" if override_reason else ("real" if final_is_real else "fake")
         result = {
+            "verdict": _verdict,
             "is_real": final_is_real,
             "is_fake": not final_is_real,
             "confidence": float(final_confidence),
@@ -721,6 +1107,16 @@ class Predictor:
             "window_fake_vote_ratio": float(fake_vote_ratio),
             "window_consensus_uncertain": bool(window_consensus_uncertain),
             "strict_fake_evidence": bool(strict_fake_evidence),
+            "confidence_margin_uncertain": bool(confidence_margin_uncertain),
+            "confidence_gap": float(_conf_gap),
+            "mouth_motion_check": mouth_check,
+            "sparse_real_guard_applied": bool(sparse_real_guard_applied),
+            "mouth_motion_override_applied": bool(mouth_motion_override_applied),
+            "override_reason": override_reason,
+            "temporal_confidence_drop": bool(temporal_confidence_drop),
+            "temporal_drift": round(_temporal_drift, 4),
+            "first_half_avg_confidence": round(_first_half_avg, 4),
+            "second_half_avg_confidence": round(_second_half_avg, 4),
             "detail": detail,
         }
         return result
@@ -812,33 +1208,39 @@ class Predictor:
 
                 # Convert logits to probability using sigmoid
                 prob_real = torch.sigmoid(logits).item()
-                confidence = float(prob_real)  # P(REAL) - probability video is authentic
-                manipulation_probability = float(1.0 - prob_real)  # P(FAKE) - probability video is manipulated
-                
-                # Determine if video is real (authentic) or fake (manipulated)
+                confidence = float(prob_real)  # P(REAL)
+
+                # Mouth motion energy check (single-face path)
+                confidence, mouth_check = self._apply_mouth_motion_check(
+                    visual_np, audio_np, confidence
+                )
+                manipulation_probability = float(1.0 - confidence)
                 is_real = confidence >= self.confidence_threshold
                 is_fake = not is_real
 
                 t_end = perf_counter()
                 logger.info(
-                    "Inference completed (single-face): is_real=%s, is_fake=%s, confidence=%.4f, manipulation_prob=%.4f, total_time_ms=%.3f, "
+                    "Inference completed (single-face): is_real=%s, is_fake=%s, "
+                    "confidence=%.4f, manipulation_prob=%.4f, total_time_ms=%.3f, "
                     "preproc_ms≈%.3f, infer_ms=%.3f",
                     is_real,
                     is_fake,
                     confidence,
                     manipulation_probability,
                     (t_end - t_start) * 1000.0,
-                    (t_pre_end - t_pre_start) * 1000.0 if 't_pre_end' in locals() else -1.0,
+                    (t_pre_end - t_pre_start) * 1000.0 if "t_pre_end" in locals() else -1.0,
                     (t_inf_end - t_inf_start) * 1000.0,
                 )
 
                 result = {
+                    "verdict": "real" if is_real else "fake",
                     "is_real": is_real,
                     "is_fake": is_fake,
                     "confidence": confidence,
                     "manipulation_probability": manipulation_probability,
                     "tracks": None,
                     "selected_track_id": None,
+                    "mouth_motion_check": mouth_check,
                 }
                 return result
             else:
@@ -943,6 +1345,19 @@ class Predictor:
                 )
                 selection_uncertain = selection_margin < self.uncertainty_margin
 
+                # Confidence Margin Rule: flag when top-2 raw confidence scores
+                # are within confidence_margin of each other.
+                if len(sorted_tracks) > 1:
+                    _conf_gap_short = abs(
+                        sorted_tracks[0]["confidence"] - sorted_tracks[1]["confidence"]
+                    )
+                    confidence_margin_uncertain_short = (
+                        _conf_gap_short < self.confidence_margin
+                    )
+                else:
+                    _conf_gap_short = 1.0
+                    confidence_margin_uncertain_short = False
+
                 track_summary = ", ".join(
                     [
                         f"track_{tr['track_id']}=sel_{tr['selection_score']:.3f}/conf_{tr['confidence']:.3f}"
@@ -951,12 +1366,15 @@ class Predictor:
                 )
                 logger.info(
                     "Track selection: selected track %s (selection_score=%.4f, confidence=%.4f), "
-                    "margin=%.4f, uncertain=%s, refined=%s (quick_margin=%.4f, refine_margin=%.4f), tracks=%d, details=[%s]",
+                    "margin=%.4f, uncertain=%s, conf_gap=%.4f, conf_margin_uncertain=%s, "
+                    "refined=%s (quick_margin=%.4f, refine_margin=%.4f), tracks=%d, details=[%s]",
                     best_track_id,
                     best_result["selection_score"],
                     best_result["confidence"],
                     selection_margin,
                     selection_uncertain,
+                    _conf_gap_short,
+                    confidence_margin_uncertain_short,
                     needs_refine,
                     quick_margin,
                     self.refine_margin,
@@ -1093,13 +1511,26 @@ class Predictor:
                     final_is_real = bool(window_agg_is_real)
                     final_confidence = float(window_agg_conf)
 
+                # Mouth motion energy check on the best track.
+                _best_visual = track_clip_map.get(best_track_id)
+                if _best_visual is not None:
+                    final_confidence, mouth_check_short = self._apply_mouth_motion_check(
+                        _best_visual, audio_np, final_confidence
+                    )
+                    final_is_real = final_confidence >= self.confidence_threshold
+                else:
+                    mouth_check_short: Dict[str, Any] = {"check_result": "no_data"}
+
                 result = {
+                    "verdict": "real" if final_is_real else "fake",
                     "is_real": final_is_real,
                     "is_fake": (not final_is_real),
                     "confidence": final_confidence,
                     "manipulation_probability": float(1.0 - final_confidence),
                     "selection_uncertain": selection_uncertain,
                     "selection_margin": selection_margin,
+                    "confidence_margin_uncertain": bool(confidence_margin_uncertain_short),
+                    "confidence_gap": float(_conf_gap_short),
                     "turn_taking_detected": bool(unique_window_speakers > 1),
                     "speaker_case": speaker_case,
                     "speaking_tracks_count": speaking_count,
@@ -1108,6 +1539,7 @@ class Predictor:
                     "verdicts": verdicts,
                     "window_results": window_results if window_results else None,
                     "speaker_timeline": speaker_timeline if speaker_timeline else None,
+                    "mouth_motion_check": mouth_check_short,
                 }
 
                 # Add track information whenever tracks are detected
@@ -1188,6 +1620,7 @@ class Predictor:
         is_fake = not is_real
 
         return {
+            "verdict": "real" if is_real else "fake",
             "is_real": is_real,
             "is_fake": is_fake,
             "confidence": confidence,

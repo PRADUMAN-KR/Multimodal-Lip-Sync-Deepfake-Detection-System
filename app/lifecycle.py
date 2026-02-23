@@ -16,19 +16,24 @@ def create_start_app_handler(app: FastAPI):
         logger.info(
             "Starting Lip Sync Detection Service on device=%s, model_path=%s, "
             "confidence_threshold=%.3f, torchscript=%s, half_precision=%s, "
-            "uncertainty_margin=%.3f, confidence_smoothing=%s, trim_ratio=%.2f, "
-            "max_tracks=%d, refine_margin=%.3f, refine_top_k=%d",
+            "uncertainty_margin=%.3f, confidence_margin=%.3f, "
+            "confidence_smoothing=%s, trim_ratio=%.2f, "
+            "max_tracks=%d, refine_margin=%.3f, refine_top_k=%d, "
+            "calibration_method=%s, mouth_motion_check=%s",
             device,
             settings.model_path,
             settings.confidence_threshold,
             settings.use_torchscript,
             settings.use_half_precision,
             settings.uncertainty_margin,
+            settings.confidence_margin,
             settings.confidence_smoothing,
             settings.trim_ratio,
             settings.max_tracks,
             settings.refine_margin,
             settings.refine_top_k,
+            settings.calibration_method,
+            settings.mouth_motion_check,
         )
         app.state.settings = settings
         app.state.device = device
@@ -57,6 +62,20 @@ def create_start_app_handler(app: FastAPI):
                 chunk_stride=settings.chunk_stride,
                 long_video_threshold_sec=settings.long_video_threshold_sec,
                 max_total_frames=settings.max_total_frames,
+                # New settings
+                confidence_margin=settings.confidence_margin,
+                calibration_method=settings.calibration_method,
+                calibration_temperature=settings.calibration_temperature,
+                calibration_platt_a=settings.calibration_platt_a,
+                calibration_platt_b=settings.calibration_platt_b,
+                calibration_isotonic_path=settings.calibration_isotonic_path,
+                mouth_motion_check=settings.mouth_motion_check,
+                mouth_motion_low_threshold=settings.mouth_motion_low_threshold,
+                mouth_motion_fake_penalty=settings.mouth_motion_fake_penalty,
+                audio_energy_high_threshold=settings.audio_energy_high_threshold,
+                audio_energy_low_threshold=settings.audio_energy_low_threshold,
+                weak_real_gate=settings.weak_real_gate,
+                weak_real_window_threshold=settings.weak_real_window_threshold,
             )
 
     return start_app
@@ -71,4 +90,3 @@ def create_stop_app_handler(app: FastAPI):
         logger.info("Lip Sync Detection Service shutdown complete")
 
     return stop_app
-
