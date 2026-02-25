@@ -29,4 +29,4 @@ python scripts/set_resource_limits.py python -m app.training.finetune \
   --lr-encoder 1e-5
 
 echo ""
-echo "Done. Best checkpoint: $OUTPUT_DIR/best_model.pth"
+echo "Done. Best checkpoints: $OUTPUT_DIR/best_model_accuracy.pth (most accurate), $OUTPUT_DIR/best_model_loss.pth (lowest loss)"

@@ -11,10 +11,12 @@ Supports:
 
 import argparse
 from pathlib import Path
+from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from ..core.device import get_device
@@ -25,6 +27,62 @@ from .augmentation import AugmentedLipSyncDataset
 from .collate import safe_collate
 
 logger = get_logger(__name__)
+
+
+def find_best_threshold(probs: list[float], labels: list[float]) -> tuple[float, float]:
+    """Sweep thresholds 0.05 → 0.95 and return threshold that maximizes F1."""
+    best_threshold = 0.5
+    best_f1 = 0.0
+    thresholds = np.linspace(0.05, 0.95, 91)
+    probs_np = np.array(probs, dtype=np.float64)
+    labels_np = np.array(labels, dtype=np.float64).astype(int)
+
+    for t in thresholds:
+        preds = (probs_np > t).astype(int)
+        tp = ((preds == 1) & (labels_np == 1)).sum()
+        fp = ((preds == 1) & (labels_np == 0)).sum()
+        fn = ((preds == 0) & (labels_np == 1)).sum()
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        if precision + recall > 0:
+            f1 = 2 * precision * recall / (precision + recall)
+        else:
+            f1 = 0.0
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = float(t)
+
+    return best_threshold, best_f1
+
+
+def _get_samples_from_dataset(dataset: Any) -> list | None:
+    """Get (path, label) samples from full dataset or wrapped dataset."""
+    if hasattr(dataset, "samples"):
+        return dataset.samples
+    if hasattr(dataset, "base_dataset"):
+        return getattr(dataset.base_dataset, "samples", None)
+    return None
+
+
+def log_class_distribution(
+    full_dataset: Any,
+    train_dataset: Subset,
+    val_dataset: Subset,
+) -> None:
+    """Log REAL/FAKE counts for train and validation before training."""
+    samples = _get_samples_from_dataset(full_dataset)
+    if not samples:
+        logger.warning("Could not infer class distribution (no samples list on dataset)")
+        return
+    train_real = sum(1 for i in train_dataset.indices if samples[i][1] == 1)
+    train_fake = len(train_dataset) - train_real
+    val_real = sum(1 for i in val_dataset.indices if samples[i][1] == 1)
+    val_fake = len(val_dataset) - val_real
+    logger.info("=" * 80)
+    logger.info("📊 Class distribution (before training):")
+    logger.info(f"  Train: REAL={train_real}, FAKE={train_fake} (total={len(train_dataset)})")
+    logger.info(f"  Val:   REAL={val_real}, FAKE={val_fake} (total={len(val_dataset)})")
+    logger.info("=" * 80)
 
 
 def freeze_encoder(model: LipSyncModel, freeze_visual: bool = True, freeze_audio: bool = True) -> None:
@@ -152,16 +210,15 @@ def validate(
     criterion: nn.Module,
     device: torch.device,
     verbose: bool = True,
-) -> tuple[float, float]:
-    """Validate and return loss and accuracy."""
+) -> tuple[float, float, dict[str, int | float]]:
+    """Validate and return loss, accuracy, and metrics (TP, TN, FP, FN, F1, best_threshold, etc.)."""
     model.eval()
     total_loss = 0.0
     correct = 0
     total = 0
-    real_correct = 0
-    real_total = 0
-    fake_correct = 0
-    fake_total = 0
+    tp = tn = fp = fn = 0
+    all_probs: list[float] = []
+    all_labels: list[float] = []
 
     with torch.no_grad():
         pbar = tqdm(dataloader, desc="Validation", disable=not verbose)
@@ -171,7 +228,7 @@ def validate(
             if batch_data is None:
                 skipped_batches += 1
                 continue
-            
+
             visual, audio, labels = batch_data
             visual = visual.to(device)
             audio = audio.to(device)
@@ -182,21 +239,24 @@ def validate(
             total_loss += loss.item()
 
             probs = torch.sigmoid(logits)
+            all_probs.extend(probs.cpu().numpy().flatten().tolist())
+            all_labels.extend(labels.cpu().numpy().flatten().tolist())
+
             pred_binary = (probs > 0.5).float()
             batch_correct = (pred_binary == labels).sum().item()
             batch_total = labels.size(0)
             correct += batch_correct
             total += batch_total
 
-            # Per-class accuracy
+            # Confusion matrix counts (label 1 = REAL, 0 = FAKE)
             real_mask = labels == 1.0
             fake_mask = labels == 0.0
-            if real_mask.any():
-                real_correct += (pred_binary[real_mask] == labels[real_mask]).sum().item()
-                real_total += real_mask.sum().item()
-            if fake_mask.any():
-                fake_correct += (pred_binary[fake_mask] == labels[fake_mask]).sum().item()
-                fake_total += fake_mask.sum().item()
+            pred_real = pred_binary == 1.0
+            pred_fake = pred_binary == 0.0
+            tp += ((pred_real) & (real_mask)).sum().item()
+            tn += ((pred_fake) & (fake_mask)).sum().item()
+            fp += ((pred_real) & (fake_mask)).sum().item()
+            fn += ((pred_fake) & (real_mask)).sum().item()
 
             if verbose:
                 running_acc = correct / total if total > 0 else 0.0
@@ -205,23 +265,76 @@ def validate(
                     "acc": f"{running_acc:.2%}",
                 })
 
-    # Calculate average loss only over processed batches (not skipped ones)
+    # Average loss
     num_processed_batches = len(dataloader) - skipped_batches
     avg_loss = total_loss / num_processed_batches if num_processed_batches > 0 else 0.0
     accuracy = correct / total if total > 0 else 0.0
-    
+
+    # F1, precision, recall at fixed threshold 0.5
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    # Threshold sweep: find threshold that maximizes F1 on validation
+    best_threshold = 0.5
+    best_f1_at_threshold = f1
+    if all_probs and all_labels:
+        best_threshold, best_f1_at_threshold = find_best_threshold(all_probs, all_labels)
+        if verbose:
+            logger.info(
+                f"  🎯 Best threshold (val) = {best_threshold:.3f} | F1 at threshold = {best_f1_at_threshold:.2%}"
+            )
+
+    metrics = {
+        "tp": int(tp),
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "best_threshold": best_threshold,
+        "best_f1_at_threshold": best_f1_at_threshold,
+    }
+
     if skipped_batches > 0 and verbose:
         logger.warning(f"⚠️  Skipped {skipped_batches} validation batches due to corrupt videos")
-    
-    if verbose and real_total > 0 and fake_total > 0:
-        real_acc = real_correct / real_total if real_total > 0 else 0.0
-        fake_acc = fake_correct / fake_total if fake_total > 0 else 0.0
+
+    if verbose:
         logger.info(
-            f"  Validation details: REAL Acc={real_acc:.2%} ({real_correct}/{real_total}), "
-            f"FAKE Acc={fake_acc:.2%} ({fake_correct}/{fake_total})"
+            f"  Validation (threshold=0.5): TP={tp}, TN={tn}, FP={fp}, FN={fn} | "
+            f"Precision={precision:.2%}, Recall={recall:.2%}, F1={f1:.2%}"
         )
-    
-    return avg_loss, accuracy
+
+    return avg_loss, accuracy, metrics
+
+
+def save_confusion_matrix_epoch(
+    output_dir: Path,
+    epoch: int,
+    tp: int,
+    tn: int,
+    fp: int,
+    fn: int,
+) -> None:
+    """Save confusion matrix for an epoch to a text file. Rows=true, cols=pred; (fake, real)."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"confusion_matrix_epoch_{epoch:03d}.txt"
+    # Rows = true class (0=fake, 1=real), Cols = predicted (0=fake, 1=real)
+    #         pred_fake  pred_real
+    # true_fake   TN        FP
+    # true_real   FN        TP
+    lines = [
+        "# Confusion matrix (rows=true, cols=pred); REAL=1, FAKE=0",
+        "#             pred_fake  pred_real",
+        f"# true_fake   {tn:>8}  {fp:>8}",
+        f"# true_real   {fn:>8}  {tp:>8}",
+        "",
+        f"TN={tn}  FP={fp}",
+        f"FN={fn}  TP={tp}",
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    logger.info(f"  Confusion matrix saved: {path}")
 
 
 def main() -> None:
@@ -278,6 +391,10 @@ def main() -> None:
     )
 
     logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+    log_class_distribution(full_dataset, train_dataset, val_dataset)
+
+    confusion_matrices_dir = args.output_dir / "confusion_matrices"
+    confusion_matrices_dir.mkdir(parents=True, exist_ok=True)
 
     train_loader = DataLoader(
         train_dataset,
@@ -328,6 +445,7 @@ def main() -> None:
 
     best_val_loss = float("inf")
     best_val_acc = 0.0
+    best_val_f1 = 0.0
     epochs_without_improvement = 0
 
     # Phase 1: Train classifier with frozen encoders
@@ -338,7 +456,18 @@ def main() -> None:
         train_loss, train_acc = train_epoch(
             model, train_loader, criterion, optimizer, device, epoch, verbose=args.verbose
         )
-        val_loss, val_acc = validate(model, val_loader, criterion, device, verbose=args.verbose)
+        val_loss, val_acc, val_metrics = validate(model, val_loader, criterion, device, verbose=args.verbose)
+
+        # Log FP/FN and save confusion matrix this epoch
+        logger.info(f"  Epoch {epoch} Val: FP={val_metrics['fp']}, FN={val_metrics['fn']}")
+        save_confusion_matrix_epoch(
+            confusion_matrices_dir,
+            epoch,
+            val_metrics["tp"],
+            val_metrics["tn"],
+            val_metrics["fp"],
+            val_metrics["fn"],
+        )
 
         current_lr = optimizer.param_groups[0]["lr"]
         logger.info("=" * 80)
@@ -347,7 +476,7 @@ def main() -> None:
         )
         logger.info(
             f"  Train: Loss={train_loss:.4f}, Acc={train_acc:.2%} | "
-            f"Val: Loss={val_loss:.4f}, Acc={val_acc:.2%} | LR={current_lr:.2e}"
+            f"Val: Loss={val_loss:.4f}, Acc={val_acc:.2%}, F1@0.5={val_metrics['f1']:.2%}, F1@best={val_metrics['best_f1_at_threshold']:.2%} (t={val_metrics['best_threshold']:.2f}) | LR={current_lr:.2e}"
         )
         logger.info("=" * 80)
         scheduler.step(val_loss)
@@ -388,6 +517,26 @@ def main() -> None:
         else:
             epochs_without_improvement += 1
 
+        # Save best based on validation F1 (using threshold-tuned F1)
+        if val_metrics["best_f1_at_threshold"] > best_val_f1:
+            best_val_f1 = val_metrics["best_f1_at_threshold"]
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                    "val_f1": val_metrics["best_f1_at_threshold"],
+                    "best_val_f1": best_val_f1,
+                    "best_threshold": val_metrics["best_threshold"],
+                },
+                args.output_dir / "best_frozen_f1.pth",
+            )
+            logger.info(
+                f"🎯 Saved best F1 frozen model (val_f1={best_val_f1:.2%}, threshold={val_metrics['best_threshold']:.3f}, epoch={epoch})"
+            )
+
     # Phase 2: Fine-tune encoders
     logger.info("Phase 2: Fine-tuning encoders (unfrozen)")
     unfreeze_encoder(model, unfreeze_visual=True, unfreeze_audio=True)
@@ -418,7 +567,18 @@ def main() -> None:
         train_loss, train_acc = train_epoch(
             model, train_loader, criterion, optimizer, device, epoch, verbose=args.verbose
         )
-        val_loss, val_acc = validate(model, val_loader, criterion, device, verbose=args.verbose)
+        val_loss, val_acc, val_metrics = validate(model, val_loader, criterion, device, verbose=args.verbose)
+
+        # Log FP/FN and save confusion matrix this epoch
+        logger.info(f"  Epoch {epoch} Val: FP={val_metrics['fp']}, FN={val_metrics['fn']}")
+        save_confusion_matrix_epoch(
+            confusion_matrices_dir,
+            epoch,
+            val_metrics["tp"],
+            val_metrics["tn"],
+            val_metrics["fp"],
+            val_metrics["fn"],
+        )
 
         current_lr = optimizer.param_groups[0]["lr"]
         logger.info("=" * 80)
@@ -427,7 +587,7 @@ def main() -> None:
         )
         logger.info(
             f"  Train: Loss={train_loss:.4f}, Acc={train_acc:.2%} | "
-            f"Val: Loss={val_loss:.4f}, Acc={val_acc:.2%} | LR={current_lr:.2e}"
+            f"Val: Loss={val_loss:.4f}, Acc={val_acc:.2%}, F1@0.5={val_metrics['f1']:.2%}, F1@best={val_metrics['best_f1_at_threshold']:.2%} (t={val_metrics['best_threshold']:.2f}) | LR={current_lr:.2e}"
         )
         logger.info("=" * 80)
         scheduler.step(val_loss)
@@ -474,6 +634,27 @@ def main() -> None:
             if phase2_epochs_without_improvement > 0:
                 logger.info(f"📉 Accuracy not improved for {phase2_epochs_without_improvement} epoch(s) (best: {best_val_acc:.2%})")
 
+        # Save best based on validation F1 (using threshold-tuned F1)
+        if val_metrics["best_f1_at_threshold"] > best_val_f1:
+            best_val_f1 = val_metrics["best_f1_at_threshold"]
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                    "val_f1": val_metrics["best_f1_at_threshold"],
+                    "best_val_f1": best_val_f1,
+                    "best_threshold": val_metrics["best_threshold"],
+                },
+                args.output_dir / "best_model_f1.pth",
+            )
+            logger.info(
+                f"🎯 Saved best F1 model (val_f1={best_val_f1:.2%}, threshold={val_metrics['best_threshold']:.3f}, epoch={epoch})"
+            )
+
         # Early stopping based on accuracy degradation
         if args.early_stopping_patience is not None:
             if epochs_without_improvement >= args.early_stopping_patience:
@@ -489,8 +670,11 @@ def main() -> None:
     logger.info(f"📊 Final Results:")
     logger.info(f"   Best validation loss: {best_val_loss:.4f}")
     logger.info(f"   Best validation accuracy: {best_val_acc:.2%}")
+    logger.info(f"   Best validation F1: {best_val_f1:.2%}")
     logger.info(f"   Best loss model: {args.output_dir / 'best_model_loss.pth'}")
     logger.info(f"   Best accuracy model: {args.output_dir / 'best_model_accuracy.pth'}")
+    logger.info(f"   Best F1 model: {args.output_dir / 'best_model_f1.pth'}")
+    logger.info(f"   Confusion matrices per epoch: {confusion_matrices_dir}")
 
 
 if __name__ == "__main__":
