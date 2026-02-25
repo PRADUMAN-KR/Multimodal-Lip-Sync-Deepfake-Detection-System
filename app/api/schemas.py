@@ -115,7 +115,7 @@ class LipSyncResponse(BaseModel):
     real/uncertain because audio was quiet AND mouth motion was near-zero."""
     override_reason: Optional[str] = None
     """Human-readable reason for any conservative override that was applied.
-    One of: 'sparse_real_signal', 'mouth_motion_uncertain', or None."""
+    One of: 'sparse_real_signal', 'mouth_motion_uncertain', 'window_consensus_mixed', or None."""
 
     # ── Temporal drift (partial-manipulation detection) ───────────────────────
     temporal_confidence_drop: Optional[bool] = None

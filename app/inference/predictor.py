@@ -871,10 +871,14 @@ class Predictor:
 
         final_is_real = final_confidence >= self.confidence_threshold
         window_consensus_uncertain = False
+        override_reason: Optional[str] = None
         # Conservative guard against false positives on mixed-content long clips.
+        # When evidence is mixed (strong real + strong fake windows, fake_vote_ratio < 0.70),
+        # lift to threshold but return verdict "uncertain" so we don't claim a confident real.
         if (not final_is_real) and mixed_window_signal and (not strict_fake_evidence):
             window_consensus_uncertain = True
             selection_uncertain = True
+            override_reason = "window_consensus_mixed"
             final_confidence = float(max(final_confidence, self.confidence_threshold))
             final_is_real = True
 
@@ -927,7 +931,6 @@ class Predictor:
         _max_window_conf = float(max(window_confs)) if window_confs else 0.0
         sparse_real_guard_applied = False
         _conf_before_sparse = final_confidence  # safe default (may be overwritten)
-        override_reason: Optional[str] = None
         if (
             not final_is_real
             and _max_window_conf >= self.weak_real_window_threshold
