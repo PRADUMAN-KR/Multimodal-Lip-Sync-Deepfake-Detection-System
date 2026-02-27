@@ -180,9 +180,7 @@ Licensed under the **Apache 2.0 License**.
 
 ##👨‍💻 Author
 
-### **Praduman Kumar**
-
-![Designation](https://img.shields.io/badge/AI%20Engineer-0A192F?style=for-the-badge)
+![Designation](https://img.shields.io/badge/Praduman%20Kumar%20|%20AI%20Engineer-0A192F?style=for-the-badge)
 
 [![GitHub](https://img.shields.io/badge/GitHub-PRADUMAN--KR-181717?style=for-the-badge&logo=github)](https://github.com/PRADUMAN-KR)
 
