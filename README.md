@@ -1,10 +1,10 @@
-# 🎯 R2Plus1D-Sync-Defense-Resnet
+## 🎯 R2Plus1D-Sync-Defense-Resnet
 
 > Production-grade Multimodal Lip-Sync Deepfake Detection System  
 > Spatio-Temporal + Cross-Modal Attention Based Forgery Detection
 
 ---
-# 🚀 Project Highlights
+## 🚀 Project Highlights
 
 ![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)
 ![PyTorch](https://img.shields.io/badge/PyTorch-DeepLearning-red.svg)
@@ -99,7 +99,7 @@ flowchart LR
 
 ---
 
-# 📦 Installation
+## 📦 Installation
 
 ```bash
 git clone https://github.com/PRADUMAN-KR/R2Plus1D-Sync-Defense-Resnet-.git
@@ -129,7 +129,7 @@ http://127.0.0.1:8000
 ---
 
 
-# ⚙️ Production Features
+##⚙️ Production Features
 
 * ✅ Multi-face tracking
 * ✅ Confidence margin rule
@@ -140,7 +140,7 @@ http://127.0.0.1:8000
 
 ---
 
-# 🔬 Research Direction
+## 🔬 Research Direction
 
 ### Future Improvements
 
@@ -152,7 +152,7 @@ http://127.0.0.1:8000
 
 ---
 
-# 📈 Deployment Options
+## 📈 Deployment Options
 
 * FastAPI REST Service
 * Dockerized Inference
@@ -162,7 +162,7 @@ http://127.0.0.1:8000
 
 ---
 
-# 🛡️ Use Cases
+##🛡️ Use Cases
 
 * Interview Fraud Detection
 * Media Authenticity Verification
@@ -172,13 +172,13 @@ http://127.0.0.1:8000
 
 ---
 
-# 📜 License
+## 📜 License
 
 Licensed under the **Apache 2.0 License**.
 
 ---
 
-# 👨‍💻 Author
+##👨‍💻 Author
 
 ### **Praduman Kumar**
 
