@@ -182,11 +182,11 @@ Licensed under the **Apache 2.0 License**.
 
 # 👨‍💻 Author
 
-**Praduman Kumar**
-AI Engineer 
-Multimodal Deep Learning | Deepfake Detection Systems | Temporal resoning
+### **Praduman Kumar**
 
-GitHub: [https://github.com/PRADUMAN-KR](https://github.com/PRADUMAN-KR)
+![Designation](https://img.shields.io/badge/AI%20Engineer-0A192F?style=for-the-badge)
+
+[![GitHub](https://img.shields.io/badge/GitHub-PRADUMAN--KR-181717?style=for-the-badge&logo=github)](https://github.com/PRADUMAN-KR)
 
 ---
 
