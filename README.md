@@ -202,8 +202,7 @@ Fusion Head	Robust classification
 This makes it a multi-level forgery reasoning system, not just a classifier.
 
 ⚙️ Installation
-git clone https://github.com/your-username/multimodal-lipsync-detection.git
-cd multimodal-lipsync-detection
+
 
 python -m venv venv
 source venv/bin/activate
@@ -247,9 +246,9 @@ MIT License
 
 Praduman Kumar
 AI / ML Engineer
+
 Multimodal Deep Learning | Deepfake Detection | Temporal Modeling
 
-🔎 SEO Keywords
 
 Lip-Sync Detection
 Deepfake Detection
