@@ -4,13 +4,26 @@
 > Spatio-Temporal + Cross-Modal Attention Based Forgery Detection
 
 ---
-
+# 🚀 Project Highlights
 
 ![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)
 ![PyTorch](https://img.shields.io/badge/PyTorch-DeepLearning-red.svg)
-![FastAPI](https://img.shields.io/badge/FastAPI-Backend-green.svg)
 ![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)
-![Status](https://img.shields.io/badge/Status-Production--Ready-success.svg)
+
+
+
+
+![Status](https://img.shields.io/badge/Status-Production%20Ready-success?style=for-the-badge)
+![Accuracy](https://img.shields.io/badge/Accuracy-96%25+-brightgreen?style=for-the-badge)
+![F1 Score](https://img.shields.io/badge/F1%20Score-0.95-blue?style=for-the-badge)
+![Deepfake Detection](https://img.shields.io/badge/Domain-Deepfake%20Detection-critical?style=for-the-badge)
+![Multimodal](https://img.shields.io/badge/Architecture-Audio--Visual%20Encoder-6C63FF?style=for-the-badge)
+![Transformer](https://img.shields.io/badge/Temporal-Transformer%20Encoder-FF6B6B?style=for-the-badge)
+![Cross Attention](https://img.shields.io/badge/Fusion-Bidirectional%20Cross--Attention-orange?style=for-the-badge)
+![PyTorch](https://img.shields.io/badge/Framework-PyTorch-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)
+![FastAPI](https://img.shields.io/badge/API-FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)
+![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=for-the-badge)
+---
 
 ---
 
@@ -87,18 +100,6 @@ flowchart LR
 
 ⚡ Optimizable to **<3s** with GPU + batching.
 
----
-
-# 🛠️ Tech Stack
-
-* Python
-* PyTorch
-* TorchVision
-* OpenCV
-* Librosa
-* NumPy
-* FastAPI
-* Uvicorn
 ---
 
 # 📦 Installation
