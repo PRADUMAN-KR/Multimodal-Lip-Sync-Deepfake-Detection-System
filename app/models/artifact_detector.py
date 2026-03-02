@@ -5,8 +5,6 @@ This module focuses on detecting visual artifacts and inconsistencies that
 AI manipulation tools (Wav2Lip, DeepFaceLab, etc.) introduce.
 """
 
-from typing import Tuple
-
 import torch
 from torch import Tensor, nn
 
@@ -64,41 +62,54 @@ class ArtifactDetector(nn.Module):
     3. Audio-visual misalignment patterns
     """
 
-    def __init__(self, visual_feature_dim: int = 256, embed_dim: int = 256) -> None:
+    def __init__(
+        self,
+        visual_feature_dim: int = 256,
+        embed_dim: int = 256,
+        use_delta_map: bool = True,
+    ) -> None:
         super().__init__()
+        self.use_delta_map = use_delta_map
         self.temporal_detector = TemporalInconsistencyDetector(visual_feature_dim)
 
         # Artifact feature dimension
         artifact_dim = visual_feature_dim // 4
 
-        # Combine artifact features with fused features
+        detector_multiplier = 2 if use_delta_map else 1
+        total_artifact_dim = artifact_dim * detector_multiplier
+
+        # Combine CLS with artifact features
         self.artifact_fusion = nn.Sequential(
-            nn.Linear(embed_dim + artifact_dim, embed_dim),
+            nn.Linear(embed_dim + total_artifact_dim, embed_dim),
             nn.ReLU(inplace=True),
             nn.Linear(embed_dim, embed_dim // 2),
             nn.ReLU(inplace=True),
         )
 
     def forward(
-        self, visual_features: Tensor, fused_features: Tensor
-    ) -> Tuple[Tensor, Tensor]:
+        self, visual_features: Tensor, cls_output: Tensor
+    ) -> Tensor:
         """
         Args:
             visual_features: (B, D_v, T, H, W) - raw visual encoder output
-            fused_features: (B, T, D_e) - fused audio-visual features
+            cls_output: (B, D_e) - CLS token from Temporal Transformer
 
         Returns:
-            artifact_features: (B, D_e//2) - artifact detection features
-            enhanced_fused: (B, T, D_e) - enhanced fused features with artifact awareness
+            artifact_features: (B, D_e//2) - artifact branch output for final concat
         """
-        # Detect temporal inconsistencies
+        # Detect temporal inconsistencies from raw feature volume.
         artifact_feat = self.temporal_detector(visual_features)  # (B, D_v//4)
 
-        # Aggregate fused features temporally
-        pooled_fused = fused_features.mean(dim=1)  # (B, D_e)
+        if self.use_delta_map:
+            if visual_features.size(2) > 1:
+                delta_map = visual_features[:, :, 1:] - visual_features[:, :, :-1]
+            else:
+                delta_map = torch.zeros_like(visual_features)
+            delta_feat = self.temporal_detector(delta_map)  # (B, D_v//4)
+            artifact_feat = torch.cat([artifact_feat, delta_feat], dim=-1)
 
-        # Combine artifact and fused features
-        combined = torch.cat([pooled_fused, artifact_feat], dim=-1)  # (B, D_e + D_v//4)
+        # Combine CLS and artifact features
+        combined = torch.cat([cls_output, artifact_feat], dim=-1)
         artifact_features = self.artifact_fusion(combined)  # (B, D_e//2)
 
-        return artifact_features, fused_features
+        return artifact_features

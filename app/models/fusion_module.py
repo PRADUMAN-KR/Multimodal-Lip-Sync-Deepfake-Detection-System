@@ -4,6 +4,79 @@ import torch
 from torch import Tensor, nn
 
 
+class CrossModalAttention(nn.Module):
+    """
+    Cross-modal attention: Video attends to Audio, Audio attends to Video,
+    then fuse into a single sequence.
+
+    Inputs:
+        visual_emb: (B, T_v, D_e)
+        audio_emb:  (B, T_a, D_e)
+
+    Output:
+        fused:      (B, T_v, D_e)
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 256,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.v2a_attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.a2v_attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.fuse = nn.Sequential(
+            nn.Linear(2 * embed_dim, embed_dim),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, visual_emb: Tensor, audio_emb: Tensor) -> Tensor:
+        if visual_emb.dim() != 3 or audio_emb.dim() != 3:
+            raise ValueError(
+                "CrossModalAttention expects visual_emb and audio_emb of shape (B, T, D_e)"
+            )
+
+        b_v, t_v, d_v = visual_emb.shape
+        b_a, t_a, d_a = audio_emb.shape
+        if b_v != b_a or d_v != d_a:
+            raise ValueError(
+                "visual_emb and audio_emb must have the same batch size and feature dim"
+            )
+
+        if t_v != t_a:
+            audio_emb = torch.nn.functional.interpolate(
+                audio_emb.transpose(1, 2),
+                size=t_v,
+                mode="linear",
+                align_corners=False,
+            ).transpose(1, 2)
+
+        # Video attends to Audio
+        v_attended, _ = self.v2a_attn(visual_emb, audio_emb, audio_emb)
+        v_out = visual_emb + v_attended
+
+        # Audio attends to Video
+        a_attended, _ = self.a2v_attn(audio_emb, visual_emb, visual_emb)
+        a_out = audio_emb + a_attended
+
+        # Fuse
+        fused = torch.cat([v_out, a_out], dim=-1)
+        return self.fuse(fused)
+
+
 class FeatureProjection(nn.Module):
     """
     Projects visual and audio encodings to a shared embedding dimension.
