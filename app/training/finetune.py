@@ -22,9 +22,10 @@ from tqdm import tqdm
 from ..core.device import get_device
 from ..core.logger import get_logger
 from ..models.lip_sync_model import LipSyncModel
-from .dataset import LipSyncDataset
 from .augmentation import AugmentedLipSyncDataset
 from .collate import safe_collate
+from .dataset import LipSyncDataset
+from .losses import cross_modal_contrastive_loss
 
 logger = get_logger(__name__)
 
@@ -111,6 +112,47 @@ def unfreeze_encoder(model: LipSyncModel, unfreeze_visual: bool = True, unfreeze
         logger.info("Unfrozen audio encoder")
 
 
+def load_checkpoint_partially(model: LipSyncModel, checkpoint_obj: Any) -> None:
+    """
+    Load only compatible checkpoint weights (matching key and shape).
+
+    This allows warm-starting from older architectures after model refactors.
+    """
+    state = checkpoint_obj.get("model_state_dict", checkpoint_obj) if isinstance(checkpoint_obj, dict) else checkpoint_obj
+    if not isinstance(state, dict):
+        raise ValueError("Checkpoint must be a state_dict or dict containing 'model_state_dict'.")
+
+    model_state = model.state_dict()
+    compatible_state: dict[str, torch.Tensor] = {}
+    skipped_missing_in_model = 0
+    skipped_shape_mismatch = 0
+
+    for key, value in state.items():
+        if key not in model_state:
+            skipped_missing_in_model += 1
+            continue
+        if model_state[key].shape != value.shape:
+            skipped_shape_mismatch += 1
+            continue
+        compatible_state[key] = value
+
+    load_result = model.load_state_dict(compatible_state, strict=False)
+    loaded_count = len(compatible_state)
+    missing_after_load = len(load_result.missing_keys)
+
+    logger.info(
+        "Partial checkpoint load: loaded=%d, skipped_missing=%d, skipped_shape=%d, model_missing_after_load=%d",
+        loaded_count,
+        skipped_missing_in_model,
+        skipped_shape_mismatch,
+        missing_after_load,
+    )
+    if skipped_shape_mismatch > 0:
+        logger.warning(
+            "Some checkpoint tensors were skipped due to shape mismatch (expected after architecture changes)."
+        )
+
+
 def train_epoch(
     model: LipSyncModel,
     dataloader: DataLoader,
@@ -118,6 +160,9 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     epoch: int,
+    contrastive_weight: float = 0.1,
+    contrastive_temperature: float = 0.07,
+    contrastive_fake_margin: float = 0.10,
     verbose: bool = True,
 ) -> tuple[float, float]:
     """Train for one epoch."""
@@ -145,8 +190,16 @@ def train_epoch(
         labels = labels.to(device)
 
         optimizer.zero_grad()
-        logits = model(visual, audio)
-        loss = criterion(logits, labels)
+        logits, aux = model(visual, audio, return_aux=True)  # type: ignore[assignment]
+        bce_loss = criterion(logits, labels)
+        contrastive_loss = cross_modal_contrastive_loss(
+            aux["visual_tokens"],
+            aux["audio_tokens"],
+            labels,
+            temperature=contrastive_temperature,
+            fake_margin=contrastive_fake_margin,
+        )
+        loss = bce_loss + contrastive_weight * contrastive_loss
         loss.backward()
 
         # Gradient clipping for stability
@@ -347,6 +400,24 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4, help="Initial learning rate")
     parser.add_argument("--lr-encoder", type=float, default=1e-5, help="LR for encoders when unfrozen")
+    parser.add_argument(
+        "--contrastive-weight",
+        type=float,
+        default=0.1,
+        help="Weight for cross-modal contrastive auxiliary loss",
+    )
+    parser.add_argument(
+        "--contrastive-temperature",
+        type=float,
+        default=0.07,
+        help="Temperature for contrastive similarity scaling",
+    )
+    parser.add_argument(
+        "--contrastive-fake-margin",
+        type=float,
+        default=0.10,
+        help="Margin for fake-pair contrastive separation",
+    )
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--use-augmentation", action="store_true", help="Use data augmentation")
     parser.add_argument("--verbose", action="store_true", default=True, help="Show verbose training output")
@@ -420,10 +491,7 @@ def main() -> None:
     if args.pretrained and args.pretrained.is_file():
         logger.info(f"Loading pre-trained weights from {args.pretrained}")
         checkpoint = torch.load(args.pretrained, map_location=device)
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-        else:
-            model.load_state_dict(checkpoint, strict=False)
+        load_checkpoint_partially(model, checkpoint)
         logger.info("Pre-trained weights loaded")
 
     # Loss and optimizer (logits)
@@ -431,7 +499,7 @@ def main() -> None:
     optimizer = torch.optim.AdamW(
         [
             {"params": model.classifier.parameters(), "lr": args.lr},
-            {"params": model.fusion.parameters(), "lr": args.lr},
+            {"params": model.cross_modal.parameters(), "lr": args.lr},
             {"params": model.projection.parameters(), "lr": args.lr},
             {"params": model.temporal.parameters(), "lr": args.lr},
         ],
@@ -454,7 +522,16 @@ def main() -> None:
 
     for epoch in range(args.freeze_epochs):
         train_loss, train_acc = train_epoch(
-            model, train_loader, criterion, optimizer, device, epoch, verbose=args.verbose
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            epoch,
+            contrastive_weight=args.contrastive_weight,
+            contrastive_temperature=args.contrastive_temperature,
+            contrastive_fake_margin=args.contrastive_fake_margin,
+            verbose=args.verbose,
         )
         val_loss, val_acc, val_metrics = validate(model, val_loader, criterion, device, verbose=args.verbose)
 
@@ -547,7 +624,7 @@ def main() -> None:
             {"params": model.visual_encoder.parameters(), "lr": args.lr_encoder},
             {"params": model.audio_encoder.parameters(), "lr": args.lr_encoder},
             {"params": model.classifier.parameters(), "lr": args.lr},
-            {"params": model.fusion.parameters(), "lr": args.lr},
+            {"params": model.cross_modal.parameters(), "lr": args.lr},
             {"params": model.projection.parameters(), "lr": args.lr},
             {"params": model.temporal.parameters(), "lr": args.lr},
         ],
@@ -565,7 +642,16 @@ def main() -> None:
 
     for epoch in range(args.freeze_epochs, args.epochs):
         train_loss, train_acc = train_epoch(
-            model, train_loader, criterion, optimizer, device, epoch, verbose=args.verbose
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            epoch,
+            contrastive_weight=args.contrastive_weight,
+            contrastive_temperature=args.contrastive_temperature,
+            contrastive_fake_margin=args.contrastive_fake_margin,
+            verbose=args.verbose,
         )
         val_loss, val_acc, val_metrics = validate(model, val_loader, criterion, device, verbose=args.verbose)
 

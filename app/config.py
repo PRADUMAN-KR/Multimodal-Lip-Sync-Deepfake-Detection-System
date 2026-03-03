@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -6,7 +7,7 @@ from pydantic import BaseModel
 
 class Settings(BaseModel):
     project_name: str = "Lip Sync Detection Service"
-    model_path: Path = Path("weights") / "best_model.pth"
+    model_path: Path = Path("weights_finetune") / "best_model_f1.pth"
     device: str = "cuda"  # or "cpu"
     confidence_threshold: float = 0.5
     use_torchscript: bool = False

@@ -1,6 +1,84 @@
 from typing import Optional
 
+import torch
 from torch import Tensor, nn
+
+
+class TemporalTransformer(nn.Module):
+    """
+    Temporal Transformer with CLS token for sequence aggregation.
+
+    Adds a learnable CLS token, runs a Transformer encoder over the sequence,
+    and returns the CLS output as the aggregated representation.
+
+    Input:  (B, T, D)
+    Output: (B, D)
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 256,
+        num_heads: int = 8,
+        num_layers: int = 4,
+        dropout: float = 0.1,
+        pre_conv: bool = True,
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.pre_conv_enabled = pre_conv
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        nn.init.normal_(self.cls_token, std=0.02)
+
+        # Lightweight local temporal smoothing before global attention.
+        self.pre_temporal_conv = nn.Sequential(
+            nn.Conv1d(embed_dim, embed_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(embed_dim),
+            nn.GELU(),
+            nn.Conv1d(embed_dim, embed_dim, kernel_size=5, padding=2, bias=False),
+            nn.BatchNorm1d(embed_dim),
+            nn.GELU(),
+        )
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+            enable_nested_tensor=False,
+        )
+
+    def forward(self, x: Tensor, lengths: Optional[Tensor] = None) -> Tensor:
+        """
+        Args:
+            x: Tensor of shape `(B, T, D)` – sequence of fused features.
+            lengths: Optional 1D tensor `(B,)` with valid lengths per sequence.
+                Not used in this implementation (full attention over sequence).
+
+        Returns:
+            Tensor of shape `(B, D)` – CLS token output.
+        """
+        if x.dim() != 3:
+            raise ValueError(
+                f"TemporalTransformer expected input of shape (B, T, D), got {tuple(x.shape)}"
+            )
+
+        b, t, d = x.shape
+        if self.pre_conv_enabled:
+            x_conv = self.pre_temporal_conv(x.transpose(1, 2)).transpose(1, 2)
+            x = x + x_conv
+
+        cls = self.cls_token.expand(b, -1, -1)
+        tokens = torch.cat([cls, x], dim=1)  # (B, 1+T, D)
+
+        out = self.transformer(tokens)
+        return out[:, 0]  # (B, D)
 
 
 class TemporalAggregation(nn.Module):

@@ -18,8 +18,9 @@ from tqdm import tqdm
 from ..core.device import get_device
 from ..core.logger import get_logger
 from ..models.lip_sync_model import LipSyncModel
-from .dataset import LipSyncDataset
 from .collate import safe_collate
+from .dataset import LipSyncDataset
+from .losses import cross_modal_contrastive_loss
 
 logger = get_logger(__name__)
 
@@ -31,6 +32,9 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     epoch: int,
+    contrastive_weight: float = 0.1,
+    contrastive_temperature: float = 0.07,
+    contrastive_fake_margin: float = 0.10,
     verbose: bool = True,
 ) -> Tuple[float, float]:
     """Train for one epoch."""
@@ -59,11 +63,18 @@ def train_epoch(
 
         optimizer.zero_grad()
 
-        # Forward pass (logits)
-        logits = model(visual, audio)  # (B,)
+        # Forward pass with auxiliary representations for contrastive training.
+        logits, aux = model(visual, audio, return_aux=True)  # type: ignore[assignment]
 
-        # Loss
-        loss = criterion(logits, labels)
+        bce_loss = criterion(logits, labels)
+        contrastive_loss = cross_modal_contrastive_loss(
+            aux["visual_tokens"],
+            aux["audio_tokens"],
+            labels,
+            temperature=contrastive_temperature,
+            fake_margin=contrastive_fake_margin,
+        )
+        loss = bce_loss + contrastive_weight * contrastive_loss
 
         # Backward pass
         loss.backward()
@@ -216,6 +227,24 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument(
+        "--contrastive-weight",
+        type=float,
+        default=0.1,
+        help="Weight for cross-modal contrastive auxiliary loss",
+    )
+    parser.add_argument(
+        "--contrastive-temperature",
+        type=float,
+        default=0.07,
+        help="Temperature for contrastive similarity scaling",
+    )
+    parser.add_argument(
+        "--contrastive-fake-margin",
+        type=float,
+        default=0.10,
+        help="Margin for fake-pair contrastive separation",
+    )
     parser.add_argument("--device", type=str, default=None, help="Device (cuda/mps/cpu)")
     parser.add_argument("--val-split", type=float, default=0.2, help="Validation split ratio")
     parser.add_argument("--resume", type=Path, default=None, help="Resume from checkpoint")
@@ -346,7 +375,16 @@ def main() -> None:
     for epoch in range(start_epoch, args.epochs):
         # Train
         train_loss, train_acc = train_epoch(
-            model, train_loader, criterion, optimizer, device, epoch, verbose=args.verbose
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            epoch,
+            contrastive_weight=args.contrastive_weight,
+            contrastive_temperature=args.contrastive_temperature,
+            contrastive_fake_margin=args.contrastive_fake_margin,
+            verbose=args.verbose,
         )
 
         # Validate
