@@ -178,7 +178,7 @@ Licensed under the **Apache 2.0 License**.
 
 ---
 
-##👨‍💻 Author
+## 👨‍💻 Author
 
 ![Designation](https://img.shields.io/badge/Praduman%20Kumar%20|%20AI%20Engineer-0A192F?style=for-the-badge)
 
