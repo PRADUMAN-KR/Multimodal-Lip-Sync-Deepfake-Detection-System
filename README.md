@@ -129,7 +129,7 @@ http://127.0.0.1:8000
 ---
 
 
-##⚙️ Production Features
+## ⚙️ Production Features
 
 * ✅ Multi-face tracking
 * ✅ Confidence margin rule
@@ -162,7 +162,7 @@ http://127.0.0.1:8000
 
 ---
 
-##🛡️ Use Cases
+## 🛡️ Use Cases
 
 * Interview Fraud Detection
 * Media Authenticity Verification
