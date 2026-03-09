@@ -8,7 +8,7 @@ Supports:
 """
 
 from pathlib import Path
-from typing import Tuple
+from typing import Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -38,17 +38,26 @@ class AugmentedLipSyncDataset(Dataset):
         audio_frames: int = 128,
         require_face_detection: bool = True,
         apply_augmentation: bool = True,
+        base_dataset: LipSyncDataset | None = None,
+        indices: Sequence[int] | None = None,
     ) -> None:
-        self.base_dataset = LipSyncDataset(
-            data_dir,
-            split=split,
-            video_frames=video_frames,
-            audio_frames=audio_frames,
-            require_face_detection=require_face_detection,
+        self.base_dataset = (
+            base_dataset
+            if base_dataset is not None
+            else LipSyncDataset(
+                data_dir,
+                split=split,
+                video_frames=video_frames,
+                audio_frames=audio_frames,
+                require_face_detection=require_face_detection,
+            )
         )
         self.apply_augmentation = apply_augmentation
+        self.indices = list(indices) if indices is not None else None
 
     def __len__(self) -> int:
+        if self.indices is not None:
+            return len(self.indices)
         return len(self.base_dataset)
 
     def _temporal_augment(
@@ -124,8 +133,12 @@ class AugmentedLipSyncDataset(Dataset):
 
         return visual, audio
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        visual, audio, label = self.base_dataset[idx]
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        base_idx = self.indices[idx] if self.indices is not None else idx
+        sample = self.base_dataset[base_idx]
+        if sample is None:
+            return None
+        visual, audio, label = sample
 
         if not self.apply_augmentation:
             return visual, audio, label

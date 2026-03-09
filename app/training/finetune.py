@@ -10,8 +10,16 @@ Supports:
 """
 
 import argparse
+import logging
+import os
+import warnings
 from pathlib import Path
 from typing import Any
+
+# Suppress noisy native logs from MediaPipe / TensorFlow Lite.
+os.environ.setdefault("GLOG_minloglevel", "3")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("ABSL_LOGGING_MIN_LOG_LEVEL", "3")
 
 import numpy as np
 import torch
@@ -28,6 +36,29 @@ from .dataset import LipSyncDataset
 from .losses import cross_modal_contrastive_loss
 
 logger = get_logger(__name__)
+
+
+def configure_runtime_logging() -> None:
+    """Keep training output focused on epoch-level metrics."""
+    # Silence per-video preprocessing logs.
+    logging.getLogger("app.preprocessing.video").setLevel(logging.WARNING)
+    logging.getLogger("app.preprocessing.face_detection").setLevel(logging.WARNING)
+
+    # Silence noisy third-party warnings that flood training output.
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*SymbolDatabase\.GetPrototype\(\) is deprecated.*",
+        category=UserWarning,
+        module=r"google\.protobuf\.symbol_database",
+    )
+    try:
+        from absl import logging as absl_logging  # type: ignore
+
+        absl_logging.set_verbosity(absl_logging.ERROR)
+        absl_logging.set_stderrthreshold("error")
+    except Exception:
+        # absl may not be installed directly; ignore if unavailable.
+        pass
 
 
 def find_best_threshold(probs: list[float], labels: list[float]) -> tuple[float, float]:
@@ -164,6 +195,7 @@ def train_epoch(
     contrastive_temperature: float = 0.07,
     contrastive_fake_margin: float = 0.10,
     verbose: bool = True,
+    log_every: int = 50,
 ) -> tuple[float, float]:
     """Train for one epoch."""
     model.train()
@@ -239,8 +271,8 @@ def train_epoch(
                 "grad": f"{grad_norm:.2f}",
             })
 
-        # Log every 50 batches
-        if verbose and (batch_idx + 1) % 50 == 0:
+        # Periodic detailed logs
+        if verbose and log_every > 0 and (batch_idx + 1) % log_every == 0:
             logger.info(
                 f"Epoch {epoch} | Batch {batch_idx + 1}/{len(dataloader)} | "
                 f"Loss: {batch_loss:.4f} (avg: {running_loss:.4f}) | "
@@ -422,12 +454,19 @@ def main() -> None:
     parser.add_argument("--use-augmentation", action="store_true", help="Use data augmentation")
     parser.add_argument("--verbose", action="store_true", default=True, help="Show verbose training output")
     parser.add_argument(
+        "--log-every",
+        type=int,
+        default=10,
+        help="Log detailed train metrics every N batches (set 0 to disable periodic batch logs)",
+    )
+    parser.add_argument(
         "--early-stopping-patience",
         type=int,
         default=None,
         help="Early stopping patience based on accuracy (stop if accuracy doesn't improve for N epochs). If None, training continues for all epochs.",
     )
     args = parser.parse_args()
+    configure_runtime_logging()
 
     device = get_device(args.device)
     logger.info("=" * 80)
@@ -442,27 +481,48 @@ def main() -> None:
         logger.info(f"  ⚠️  Using CPU (slower - consider using GPU)")
     logger.info(f"  Batch size: {args.batch_size}")
     logger.info(f"  Learning rate: {args.lr} (encoders: {args.lr_encoder})")
+    logger.info(f"  Detailed batch log frequency: every {args.log_every} batches")
     logger.info("=" * 80)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Dataset with optional augmentation
-    if args.use_augmentation:
-        full_dataset = AugmentedLipSyncDataset(args.data_dir)
-        logger.info("Using data augmentation")
-    else:
-        full_dataset = LipSyncDataset(args.data_dir)
+    # Resolve data_dir to absolute; strip surrounding quotes (e.g. Jenkins may pass "data/AVLips12").
+    data_dir_str = str(args.data_dir).strip().strip('"').strip("'")
+    data_dir = (Path(data_dir_str) if Path(data_dir_str).is_absolute() else (Path.cwd() / data_dir_str)).resolve()
+    logger.info(f"  Data directory (resolved): {data_dir}")
+    if not data_dir.is_dir():
+        raise FileNotFoundError(f"Data directory does not exist: {data_dir} (cwd={Path.cwd()})")
+
+    # Build a single base dataset so train/val share the exact same split universe.
+    full_dataset = LipSyncDataset(data_dir)
 
     dataset_size = len(full_dataset)
     val_size = int(dataset_size * 0.2)
     train_size = dataset_size - val_size
 
-    train_dataset, val_dataset = torch.utils.data.random_split(
+    train_subset, val_subset = torch.utils.data.random_split(
         full_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42)
     )
 
+    train_indices = list(train_subset.indices)
+    val_indices = list(val_subset.indices)
+
+    if args.use_augmentation:
+        logger.info("Using data augmentation for training split only")
+        train_dataset = AugmentedLipSyncDataset(
+            data_dir=data_dir,
+            base_dataset=full_dataset,
+            indices=train_indices,
+            apply_augmentation=True,
+        )
+    else:
+        train_dataset = train_subset
+
+    # Keep validation clean (non-augmented) for reliable metrics.
+    val_dataset = val_subset
+
     logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
-    log_class_distribution(full_dataset, train_dataset, val_dataset)
+    log_class_distribution(full_dataset, train_subset, val_subset)
 
     confusion_matrices_dir = args.output_dir / "confusion_matrices"
     confusion_matrices_dir.mkdir(parents=True, exist_ok=True)
@@ -532,6 +592,7 @@ def main() -> None:
             contrastive_temperature=args.contrastive_temperature,
             contrastive_fake_margin=args.contrastive_fake_margin,
             verbose=args.verbose,
+            log_every=args.log_every,
         )
         val_loss, val_acc, val_metrics = validate(model, val_loader, criterion, device, verbose=args.verbose)
 
@@ -652,6 +713,7 @@ def main() -> None:
             contrastive_temperature=args.contrastive_temperature,
             contrastive_fake_margin=args.contrastive_fake_margin,
             verbose=args.verbose,
+            log_every=args.log_every,
         )
         val_loss, val_acc, val_metrics = validate(model, val_loader, criterion, device, verbose=args.verbose)
 

@@ -7,16 +7,42 @@ Supports:
 - Robust tracking across frames
 """
 
+import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# Suppress MediaPipe / TensorFlow internal logs (glog, EGL, inference_feedback_manager, etc.)
+# Must be set before mediapipe is imported.
+os.environ.setdefault("GLOG_minloglevel", "2")  # 0=INFO, 1=WARNING, 2=ERROR, 3=FATAL
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")  # Suppress TF native logs
+
 import cv2
 import numpy as np
-import sys
 
 from ..core.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Reuse detector instances to avoid repeated MediaPipe/TFLite initialization noise.
+_DETECTOR_CACHE: Dict[Tuple[int, float, float], "FaceDetector"] = {}
+
+
+def _get_cached_face_detector(
+    max_num_faces: int,
+    min_detection_confidence: float = 0.3,
+    min_tracking_confidence: float = 0.3,
+) -> "FaceDetector":
+    key = (int(max_num_faces), float(min_detection_confidence), float(min_tracking_confidence))
+    detector = _DETECTOR_CACHE.get(key)
+    if detector is None:
+        detector = FaceDetector(
+            max_num_faces=max_num_faces,
+            min_detection_confidence=min_detection_confidence,
+            min_tracking_confidence=min_tracking_confidence,
+        )
+        _DETECTOR_CACHE[key] = detector
+    return detector
 
 
 class FaceDetector:
@@ -560,7 +586,7 @@ def detect_and_crop_mouths(
         RuntimeError: If face detection fails catastrophically (MediaPipe crash, etc.)
     """
     try:
-        detector = FaceDetector(max_num_faces=max_faces)
+        detector = _get_cached_face_detector(max_num_faces=max_faces)
     except Exception as e:
         raise RuntimeError(
             f"Failed to initialize FaceDetector: {e}\n"
@@ -672,7 +698,7 @@ def detect_and_crop_mouth_tracks(
         - ``stability``    : weighted stability score in [0, 1]
         - ``consecutive_miss_max``: worst consecutive-miss streak
     """
-    detector = FaceDetector(
+    detector = _get_cached_face_detector(
         max_num_faces=max_faces,
         min_detection_confidence=min_detection_confidence,
         min_tracking_confidence=min_tracking_confidence,
