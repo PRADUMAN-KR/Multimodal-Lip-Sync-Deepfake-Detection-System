@@ -11,6 +11,13 @@ from ..preprocessing.video import preprocess_video
 
 logger = get_logger(__name__)
 
+# Video extensions supported (case-insensitive): .mp4, .mov, .avi
+VIDEO_EXTENSIONS = (".mp4", ".mov", ".avi")
+
+
+def _is_video(path: Path) -> bool:
+    return path.suffix.lower() in VIDEO_EXTENSIONS
+
 
 class LipSyncDataset(Dataset):
     """
@@ -18,11 +25,11 @@ class LipSyncDataset(Dataset):
 
     Expected directory structure:
         data/
-            AVLips1 2/
-                0_real/    # REAL videos (unmodified, natural lip-sync) (label=1)
-                    *.mp4
-                1_fake/    # FAKE videos (AI-manipulated with tools like Wav2Lip) (label=0)
-                    *.mp4
+            AVLips12/
+                0_real/ or real/    # REAL videos (label=1)
+                    *.mp4, *.mov, *.avi (case-insensitive)
+                1_fake/ or fake/   # FAKE videos (label=0)
+                    *.mp4, *.mov, *.avi (case-insensitive)
 
     Label meaning:
         - 1 = REAL: Natural, unmodified video with authentic lip-sync
@@ -52,38 +59,66 @@ class LipSyncDataset(Dataset):
         # Build list of (video_path, label) pairs
         self.samples: list[Tuple[Path, int]] = []
 
-        if (self.data_dir / "0_real").is_dir() and (self.data_dir / "1_fake").is_dir():
-            # AVLips-style structure
-            real_dir = self.data_dir / "0_real"
-            fake_dir = self.data_dir / "1_fake"
-
-            for vid_path in real_dir.glob("*.mp4"):
-                self.samples.append((vid_path, 1))  # REAL = 1 (not manipulated)
-
-            for vid_path in fake_dir.glob("*.mp4"):
-                self.samples.append((vid_path, 0))  # FAKE = 0 (AI-manipulated)
+        # Prefer named subdirs: 0_real/1_fake (AVLips) or real/fake (case-insensitive)
+        def _find_subdir(*names: str):
+            for n in names:
+                p = self.data_dir / n
+                if p.is_dir():
+                    return p
+            # Case-insensitive fallback (e.g. Real, Fake on Linux)
+            for c in self.data_dir.iterdir():
+                if c.is_dir() and c.name.lower() in {n.lower() for n in names}:
+                    return c
+            return None
+        real_dir = _find_subdir("0_real", "real")
+        fake_dir = _find_subdir("1_fake", "fake")
+        if real_dir is not None and fake_dir is not None:
+            for vid_path in real_dir.iterdir():
+                if vid_path.is_file() and _is_video(vid_path):
+                    self.samples.append((vid_path, 1))  # REAL = 1
+            for vid_path in fake_dir.iterdir():
+                if vid_path.is_file() and _is_video(vid_path):
+                    self.samples.append((vid_path, 0))  # FAKE = 0
         else:
-            # Assume flat directory or custom structure
-            for vid_path in self.data_dir.rglob("*.mp4"):
-                # Infer label from parent directory name
-                parent = vid_path.parent.name.lower()
-                if "real" in parent or "authentic" in parent or "natural" in parent:
-                    label = 1  # REAL (not manipulated)
-                elif (
-                    "fake" in parent
-                    or "manipulated" in parent
-                    or "ai" in parent
-                    or "wav2lip" in parent
-                    or "deepfake" in parent
-                ):
-                    label = 0  # FAKE (AI-manipulated)
-                else:
-                    # Default: assume real if we can't tell
-                    label = 1
-                self.samples.append((vid_path, label))
+            # Assume flat or custom structure: find any video under data_dir
+            for vid_path in self.data_dir.rglob("*"):
+                if vid_path.is_file() and _is_video(vid_path):
+                    parent = vid_path.parent.name.lower()
+                    if "real" in parent or "authentic" in parent or "natural" in parent:
+                        label = 1
+                    elif (
+                        "fake" in parent
+                        or "manipulated" in parent
+                        or "ai" in parent
+                        or "wav2lip" in parent
+                        or "deepfake" in parent
+                    ):
+                        label = 0
+                    else:
+                        label = 1
+                    self.samples.append((vid_path, label))
 
         if not self.samples:
-            raise ValueError(f"No video files found in {data_dir}")
+            data_dir_resolved = self.data_dir.resolve()
+            msg = (
+                f"No video files found in {data_dir}\n"
+                f"  Resolved path: {data_dir_resolved}\n"
+                f"  Directory exists: {self.data_dir.is_dir()}\n"
+            )
+            if self.data_dir.is_dir():
+                subdirs = [p.name for p in self.data_dir.iterdir() if p.is_dir()]
+                files = [p.name for p in self.data_dir.iterdir() if p.is_file()]
+                msg += f"  Subdirectories: {subdirs or '(none)'}\n"
+                msg += f"  Files in root: {len(files)} (extensions: {list(set(p.suffix for p in self.data_dir.iterdir() if p.is_file()))})\n"
+                for name in ("0_real", "1_fake", "real", "fake"):
+                    d = self.data_dir / name
+                    if d.is_dir():
+                        n = sum(1 for p in d.iterdir() if p.is_file() and _is_video(p))
+                        msg += f"  {name}/: {n} video(s)\n"
+            else:
+                msg += f"  Current working directory: {Path.cwd()}\n"
+                msg += "  Tip: Use an absolute path for --data-dir, or run from the repo root so 'data/AVLips12' exists.\n"
+            raise ValueError(msg)
 
         # Test MediaPipe if face detection is required
         if self.require_face_detection:
