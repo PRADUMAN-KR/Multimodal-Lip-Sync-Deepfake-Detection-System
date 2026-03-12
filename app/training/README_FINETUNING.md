@@ -75,6 +75,48 @@ python -m app.training.finetune \
   --device mps
 ```
 
+### Step 2.5: Precompute tensors (recommended for large datasets)
+
+For large datasets, run MediaPipe + video decode once offline, then train from tensors.
+
+```bash
+python scripts/precompute_training_tensors.py \
+  --data-dir "data/AVLips1 2" \
+  --output-dir data/precomputed_avlips \
+  --storage-format npy
+```
+
+or LMDB:
+
+```bash
+python scripts/precompute_training_tensors.py \
+  --data-dir "data/AVLips1 2" \
+  --output-dir data/precomputed_avlips_lmdb \
+  --storage-format lmdb
+```
+
+or Zarr:
+
+```bash
+python scripts/precompute_training_tensors.py \
+  --data-dir "data/AVLips1 2" \
+  --output-dir data/precomputed_avlips_zarr \
+  --storage-format zarr
+```
+
+Then train/fine-tune using:
+
+```bash
+python -m app.training.finetune \
+  --data-dir "data/AVLips1 2" \
+  --preprocessed-dir data/precomputed_avlips \
+  --storage-format npy \
+  --pretrained weights/best_model.pth \
+  --epochs 30 \
+  --batch-size 8 \
+  --device mps
+```
+
 **Parameters:**
 - `--pretrained`: Path to pre-trained weights (from Step 1 or external)
 - `--freeze-epochs`: Epochs with frozen encoders (Phase 1)

@@ -34,13 +34,18 @@ class LipSyncModel(nn.Module):
         temporal_heads: int = 8,
         temporal_pre_conv: bool = True,
         use_delta_artifact: bool = True,
+        use_high_freq_artifact: bool = True,
+        preserve_audio_temporal: bool = True,
     ) -> None:
         super().__init__()
         self.detect_artifacts = detect_artifacts
 
         # Encoders
         self.visual_encoder = VisualEncoder(feature_dim=visual_feature_dim)
-        self.audio_encoder = AudioEncoder(feature_dim=audio_feature_dim)
+        self.audio_encoder = AudioEncoder(
+            feature_dim=audio_feature_dim,
+            preserve_audio_temporal=preserve_audio_temporal,
+        )
 
         # Feature projection + cross-modal attention
         self.projection = FeatureProjection(
@@ -67,6 +72,7 @@ class LipSyncModel(nn.Module):
                 visual_feature_dim=visual_feature_dim,
                 embed_dim=embed_dim,
                 use_delta_map=use_delta_artifact,
+                use_high_freq=use_high_freq_artifact,
             )
             classifier_input_dim = embed_dim + embed_dim // 2  # 256 + 128
         else:
@@ -112,7 +118,7 @@ class LipSyncModel(nn.Module):
         if self.detect_artifacts and self.artifact_detector is not None:
             if v_map is None:
                 raise RuntimeError("Artifact detection enabled but visual feature map is missing.")
-            artifact_feat = self.artifact_detector(v_map, cls_output)  # (B, 128)
+            artifact_feat = self.artifact_detector(v_map, cls_output, raw_video=visual)  # (B, 128)
             combined = torch.cat([cls_output, artifact_feat], dim=-1)  # (B, 384)
         else:
             combined = cls_output

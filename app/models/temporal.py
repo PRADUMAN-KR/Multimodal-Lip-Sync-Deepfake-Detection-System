@@ -22,22 +22,44 @@ class TemporalTransformer(nn.Module):
         num_layers: int = 4,
         dropout: float = 0.1,
         pre_conv: bool = True,
+        multi_scale_pre_conv: bool = True,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
         self.pre_conv_enabled = pre_conv
+        self.multi_scale_pre_conv = multi_scale_pre_conv
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         nn.init.normal_(self.cls_token, std=0.02)
 
-        # Lightweight local temporal smoothing before global attention.
-        self.pre_temporal_conv = nn.Sequential(
-            nn.Conv1d(embed_dim, embed_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm1d(embed_dim),
-            nn.GELU(),
-            nn.Conv1d(embed_dim, embed_dim, kernel_size=5, padding=2, bias=False),
-            nn.BatchNorm1d(embed_dim),
-            nn.GELU(),
-        )
+        # Multi-scale temporal conv: k=3 (micro lip), k=5 (phoneme), k=7 (syllable) -> concat -> linear.
+        if multi_scale_pre_conv:
+            self.branch_k3 = nn.Sequential(
+                nn.Conv1d(embed_dim, embed_dim, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm1d(embed_dim),
+                nn.GELU(),
+            )
+            self.branch_k5 = nn.Sequential(
+                nn.Conv1d(embed_dim, embed_dim, kernel_size=5, padding=2, bias=False),
+                nn.BatchNorm1d(embed_dim),
+                nn.GELU(),
+            )
+            self.branch_k7 = nn.Sequential(
+                nn.Conv1d(embed_dim, embed_dim, kernel_size=7, padding=3, bias=False),
+                nn.BatchNorm1d(embed_dim),
+                nn.GELU(),
+            )
+            self.pre_scale_proj = nn.Linear(3 * embed_dim, embed_dim)
+        else:
+            self.branch_k3 = self.branch_k5 = self.branch_k7 = None
+            self.pre_scale_proj = None
+            self.pre_temporal_conv = nn.Sequential(
+                nn.Conv1d(embed_dim, embed_dim, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm1d(embed_dim),
+                nn.GELU(),
+                nn.Conv1d(embed_dim, embed_dim, kernel_size=5, padding=2, bias=False),
+                nn.BatchNorm1d(embed_dim),
+                nn.GELU(),
+            )
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
@@ -71,7 +93,15 @@ class TemporalTransformer(nn.Module):
 
         b, t, d = x.shape
         if self.pre_conv_enabled:
-            x_conv = self.pre_temporal_conv(x.transpose(1, 2)).transpose(1, 2)
+            if self.multi_scale_pre_conv and self.branch_k3 is not None:
+                x_t = x.transpose(1, 2)  # (B, D, T)
+                c3 = self.branch_k3(x_t)   # (B, D, T)
+                c5 = self.branch_k5(x_t)   # (B, D, T)
+                c7 = self.branch_k7(x_t)   # (B, D, T)
+                x_conv = torch.cat([c3, c5, c7], dim=1).transpose(1, 2)  # (B, T, 3*D)
+                x_conv = self.pre_scale_proj(x_conv)  # (B, T, D)
+            else:
+                x_conv = self.pre_temporal_conv(x.transpose(1, 2)).transpose(1, 2)
             x = x + x_conv
 
         cls = self.cls_token.expand(b, -1, -1)

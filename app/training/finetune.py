@@ -12,9 +12,10 @@ Supports:
 import argparse
 import logging
 import os
+import random
 import warnings
 from pathlib import Path
-from typing import Any
+from typing import Any, Tuple
 
 # Suppress noisy native logs from MediaPipe / TensorFlow Lite.
 os.environ.setdefault("GLOG_minloglevel", "3")
@@ -24,7 +25,7 @@ os.environ.setdefault("ABSL_LOGGING_MIN_LOG_LEVEL", "3")
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 
 from ..core.device import get_device
@@ -33,9 +34,36 @@ from ..models.lip_sync_model import LipSyncModel
 from .augmentation import AugmentedLipSyncDataset
 from .collate import safe_collate
 from .dataset import LipSyncDataset
-from .losses import cross_modal_contrastive_loss
+from .losses import cross_modal_contrastive_loss, sync_contrastive_loss
 
 logger = get_logger(__name__)
+
+
+def _shift_audio(audio: torch.Tensor, shift_frames: int) -> torch.Tensor:
+    """Shift audio along time (last dim). (B, 1, F, T) -> same shape, rolled by shift_frames."""
+    if shift_frames == 0:
+        return audio
+    return torch.roll(audio, shifts=shift_frames, dims=-1)
+
+
+class ModeOverrideSubset(Dataset):
+    """
+    Subset wrapper that can override random/center clip sampling mode.
+    """
+
+    def __init__(self, subset: Subset, train_mode: bool) -> None:
+        self.subset = subset
+        self.train_mode = bool(train_mode)
+
+    def __len__(self) -> int:
+        return len(self.subset)
+
+    def __getitem__(self, idx: int):
+        base_dataset = self.subset.dataset
+        real_idx = self.subset.indices[idx]
+        if hasattr(base_dataset, "get_item"):
+            return base_dataset.get_item(real_idx, train_mode_override=self.train_mode)
+        return base_dataset[real_idx]
 
 
 def configure_runtime_logging() -> None:
@@ -194,6 +222,8 @@ def train_epoch(
     contrastive_weight: float = 0.1,
     contrastive_temperature: float = 0.07,
     contrastive_fake_margin: float = 0.10,
+    sync_weight: float = 0.0,
+    sync_shift_frames: Tuple[int, ...] = (5, 10, 15),
     verbose: bool = True,
     log_every: int = 50,
 ) -> tuple[float, float]:
@@ -232,6 +262,20 @@ def train_epoch(
             fake_margin=contrastive_fake_margin,
         )
         loss = bce_loss + contrastive_weight * contrastive_loss
+        if sync_weight > 0 and sync_shift_frames and (labels >= 0.5).any():
+            shifts = [s for s in sync_shift_frames if s != 0] + [-s for s in sync_shift_frames if s != 0]
+            shift = random.choice(shifts) if shifts else 0
+            if shift != 0:
+                audio_shifted = _shift_audio(audio, shift)
+                _, aux_neg = model(visual, audio_shifted, return_aux=True)  # type: ignore[assignment]
+                sync_loss = sync_contrastive_loss(
+                    aux["visual_tokens"],
+                    aux["audio_tokens"],
+                    [aux_neg["audio_tokens"]],
+                    real_mask=(labels >= 0.5),
+                    temperature=contrastive_temperature,
+                )
+                loss = loss + sync_weight * sync_loss
         loss.backward()
 
         # Gradient clipping for stability
@@ -425,13 +469,27 @@ def save_confusion_matrix_epoch(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fine-tune lip-sync manipulation detection model")
     parser.add_argument("--data-dir", type=Path, required=True, help="Training data directory")
+    parser.add_argument(
+        "--preprocessed-dir",
+        type=Path,
+        default=None,
+        help="Optional path to precomputed tensors directory (manifest.jsonl).",
+    )
+    parser.add_argument(
+        "--storage-format",
+        type=str,
+        default="npy",
+        choices=["npy", "lmdb", "zarr"],
+        help="Storage backend when --preprocessed-dir is provided.",
+    )
     parser.add_argument("--pretrained", type=Path, help="Path to pre-trained weights")
     parser.add_argument("--output-dir", type=Path, default=Path("weights"), help="Checkpoint output directory")
     parser.add_argument("--epochs", type=int, default=30, help="Total epochs")
     parser.add_argument("--freeze-epochs", type=int, default=10, help="Epochs with frozen encoders")
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-4, help="Initial learning rate")
-    parser.add_argument("--lr-encoder", type=float, default=1e-5, help="LR for encoders when unfrozen")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Initial learning rate (main layers)")
+    parser.add_argument("--lr-encoder", type=float, default=5e-5, help="LR for encoders when unfrozen (default 5e-5)")
+    parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay (e.g. 0.01 for stronger regularization)")
     parser.add_argument(
         "--contrastive-weight",
         type=float,
@@ -450,6 +508,18 @@ def main() -> None:
         default=0.10,
         help="Margin for fake-pair contrastive separation",
     )
+    parser.add_argument(
+        "--sync-weight",
+        type=float,
+        default=0.2,
+        help="Weight for sync contrastive loss (video vs shifted-audio). 0 to disable. Default 0.2.",
+    )
+    parser.add_argument(
+        "--sync-shift-frames",
+        type=str,
+        default="5,10,15",
+        help="Comma-separated frame shifts for sync negatives (e.g. 5,10,15). Default 5,10,15.",
+    )
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--use-augmentation", action="store_true", help="Use data augmentation")
     parser.add_argument("--verbose", action="store_true", default=True, help="Show verbose training output")
@@ -465,7 +535,18 @@ def main() -> None:
         default=None,
         help="Early stopping patience based on accuracy (stop if accuracy doesn't improve for N epochs). If None, training continues for all epochs.",
     )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help=(
+            "DataLoader worker processes. Safe to set >0 when using --preprocessed-dir "
+            "(no MediaPipe in hot path). Keep 0 when training from raw video (MediaPipe "
+            "is not fork-safe)."
+        ),
+    )
     args = parser.parse_args()
+    args.sync_shift_frames = tuple(int(x.strip()) for x in args.sync_shift_frames.split(",") if x.strip())
     configure_runtime_logging()
 
     device = get_device(args.device)
@@ -494,7 +575,17 @@ def main() -> None:
         raise FileNotFoundError(f"Data directory does not exist: {data_dir} (cwd={Path.cwd()})")
 
     # Build a single base dataset so train/val share the exact same split universe.
-    full_dataset = LipSyncDataset(data_dir)
+    if args.preprocessed_dir:
+        logger.info(
+            "Using precomputed dataset: dir=%s format=%s",
+            args.preprocessed_dir,
+            args.storage_format,
+        )
+    full_dataset = LipSyncDataset(
+        data_dir,
+        preprocessed_dir=args.preprocessed_dir,
+        storage_format=args.storage_format,
+    )
 
     dataset_size = len(full_dataset)
     val_size = int(dataset_size * 0.2)
@@ -516,10 +607,10 @@ def main() -> None:
             apply_augmentation=True,
         )
     else:
-        train_dataset = train_subset
+        train_dataset = ModeOverrideSubset(train_subset, train_mode=True)
 
     # Keep validation clean (non-augmented) for reliable metrics.
-    val_dataset = val_subset
+    val_dataset = ModeOverrideSubset(val_subset, train_mode=False)
 
     logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
     log_class_distribution(full_dataset, train_subset, val_subset)
@@ -531,17 +622,19 @@ def main() -> None:
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
         collate_fn=safe_collate,
+        persistent_workers=args.num_workers > 0,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
         collate_fn=safe_collate,
+        persistent_workers=args.num_workers > 0,
     )
 
     # Model
@@ -563,7 +656,7 @@ def main() -> None:
             {"params": model.projection.parameters(), "lr": args.lr},
             {"params": model.temporal.parameters(), "lr": args.lr},
         ],
-        weight_decay=1e-4,
+        weight_decay=getattr(args, "weight_decay", 1e-4),
     )
 
     if model.artifact_detector:
@@ -591,6 +684,8 @@ def main() -> None:
             contrastive_weight=args.contrastive_weight,
             contrastive_temperature=args.contrastive_temperature,
             contrastive_fake_margin=args.contrastive_fake_margin,
+            sync_weight=getattr(args, "sync_weight", 0.0),
+            sync_shift_frames=getattr(args, "sync_shift_frames", (5, 10, 15)),
             verbose=args.verbose,
             log_every=args.log_every,
         )
@@ -689,7 +784,7 @@ def main() -> None:
             {"params": model.projection.parameters(), "lr": args.lr},
             {"params": model.temporal.parameters(), "lr": args.lr},
         ],
-        weight_decay=1e-4,
+        weight_decay=getattr(args, "weight_decay", 1e-4),
     )
 
     if model.artifact_detector:
@@ -712,6 +807,8 @@ def main() -> None:
             contrastive_weight=args.contrastive_weight,
             contrastive_temperature=args.contrastive_temperature,
             contrastive_fake_margin=args.contrastive_fake_margin,
+            sync_weight=getattr(args, "sync_weight", 0.0),
+            sync_shift_frames=getattr(args, "sync_shift_frames", (5, 10, 15)),
             verbose=args.verbose,
             log_every=args.log_every,
         )

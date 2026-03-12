@@ -1,8 +1,55 @@
 from __future__ import annotations
 
+from typing import List
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+
+
+def sync_contrastive_loss(
+    visual_tokens: Tensor,
+    audio_tokens: Tensor,
+    audio_tokens_negatives: List[Tensor],
+    real_mask: Tensor | None = None,
+    temperature: float = 0.07,
+) -> Tensor:
+    """
+    Temporal alignment contrastive: (video, correct_audio) vs (video, shifted_audio).
+    Pulls in-sync pairs together and pushes shifted-audio pairs apart.
+    Apply only on REAL (label=1) samples; pass real_mask to mask fake samples.
+
+    Args:
+        visual_tokens: (B, T, D)
+        audio_tokens: (B, T, D) — correct (aligned) audio
+        audio_tokens_negatives: list of (B, T, D) — audio shifted by ±5, ±10, ±15 frames
+        real_mask: (B,) boolean, True = real (in-sync) sample. If None, use all.
+        temperature: softmax temperature
+    """
+    if not audio_tokens_negatives:
+        return visual_tokens.new_zeros(())
+
+    if real_mask is not None and not real_mask.any():
+        return visual_tokens.new_zeros(())
+
+    if real_mask is not None:
+        visual_tokens = visual_tokens[real_mask]
+        audio_tokens = audio_tokens[real_mask]
+        audio_tokens_negatives = [a[real_mask] for a in audio_tokens_negatives]
+
+    v = F.normalize(visual_tokens.mean(dim=1), dim=-1)  # (B, D)
+    a = F.normalize(audio_tokens.mean(dim=1), dim=-1)   # (B, D)
+    pos_sim = (v * a).sum(dim=-1) / max(temperature, 1e-6)  # (B,)
+
+    neg_sims = []
+    for a_neg in audio_tokens_negatives:
+        a_neg_flat = F.normalize(a_neg.mean(dim=1), dim=-1)  # (B, D)
+        neg_sims.append((v * a_neg_flat).sum(dim=-1) / max(temperature, 1e-6))  # (B,)
+    neg_sim = torch.stack(neg_sims, dim=1)  # (B, N_neg)
+
+    logits = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)  # (B, 1+N_neg)
+    target = logits.new_zeros(logits.size(0), dtype=torch.long)
+    return F.cross_entropy(logits, target)
 
 
 def cross_modal_contrastive_loss(

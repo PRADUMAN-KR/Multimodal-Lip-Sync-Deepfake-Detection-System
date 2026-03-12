@@ -40,6 +40,8 @@ class AugmentedLipSyncDataset(Dataset):
         apply_augmentation: bool = True,
         base_dataset: LipSyncDataset | None = None,
         indices: Sequence[int] | None = None,
+        preprocessed_dir: Path | str | None = None,
+        storage_format: str = "npy",
     ) -> None:
         self.base_dataset = (
             base_dataset
@@ -50,6 +52,8 @@ class AugmentedLipSyncDataset(Dataset):
                 video_frames=video_frames,
                 audio_frames=audio_frames,
                 require_face_detection=require_face_detection,
+                preprocessed_dir=Path(preprocessed_dir) if preprocessed_dir else None,
+                storage_format=storage_format,
             )
         )
         self.apply_augmentation = apply_augmentation
@@ -129,13 +133,18 @@ class AugmentedLipSyncDataset(Dataset):
 
         if np.random.rand() > 0.5:
             noise_audio = np.random.normal(0, 0.01, audio.shape).astype(audio.dtype)
-            audio = np.clip(audio + noise_audio, -1, 1)
+            # Mel-dB values from power_to_db(ref=np.max) are in [-80, 0].
+            # Clipping to [-1, 1] would destroy the spectrogram.
+            audio = np.clip(audio + noise_audio, -80.0, 0.0)
 
         return visual, audio
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         base_idx = self.indices[idx] if self.indices is not None else idx
-        sample = self.base_dataset[base_idx]
+        if hasattr(self.base_dataset, "get_item"):
+            sample = self.base_dataset.get_item(base_idx, train_mode_override=True)
+        else:
+            sample = self.base_dataset[base_idx]
         if sample is None:
             return None
         visual, audio, label = sample

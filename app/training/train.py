@@ -3,26 +3,113 @@
 Training script for lip-sync detection model.
 
 Usage:
-    python -m app.training.train --data-dir data/AVLips1\ 2 --epochs 50 --batch-size 8
+    python -m app.training.train --data-dir \"data/AVLips1 2\" --epochs 50 --batch-size 8
 """
 
 import argparse
+import random
 from pathlib import Path
 from typing import Tuple
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 
 from ..core.device import get_device
 from ..core.logger import get_logger
 from ..models.lip_sync_model import LipSyncModel
+from .augmentation import AugmentedLipSyncDataset
 from .collate import safe_collate
 from .dataset import LipSyncDataset
-from .losses import cross_modal_contrastive_loss
+from .losses import cross_modal_contrastive_loss, sync_contrastive_loss
 
 logger = get_logger(__name__)
+
+
+def _shift_audio(audio: torch.Tensor, shift_frames: int) -> torch.Tensor:
+    """Shift audio along time (last dim). (B, 1, F, T) -> same shape, rolled by shift_frames."""
+    if shift_frames == 0:
+        return audio
+    return torch.roll(audio, shifts=shift_frames, dims=-1)
+
+
+class ModeOverrideSubset(Dataset):
+    """
+    Subset wrapper that can override random/center clip sampling mode.
+    """
+
+    def __init__(self, subset: Subset, train_mode: bool) -> None:
+        self.subset = subset
+        self.train_mode = bool(train_mode)
+
+    def __len__(self) -> int:
+        return len(self.subset)
+
+    def __getitem__(self, idx: int):
+        base_dataset = self.subset.dataset
+        real_idx = self.subset.indices[idx]
+        if hasattr(base_dataset, "get_item"):
+            return base_dataset.get_item(real_idx, train_mode_override=self.train_mode)
+        return base_dataset[real_idx]
+
+
+def _freeze_encoder(
+    model: LipSyncModel, freeze_visual: bool = True, freeze_audio: bool = True
+) -> None:
+    """Freeze encoder parameters (for phased training)."""
+    if freeze_visual:
+        for param in model.visual_encoder.parameters():
+            param.requires_grad = False
+    if freeze_audio:
+        for param in model.audio_encoder.parameters():
+            param.requires_grad = False
+
+
+def _unfreeze_encoder(
+    model: LipSyncModel, unfreeze_visual: bool = True, unfreeze_audio: bool = True
+) -> None:
+    """Unfreeze encoder parameters (for phased training)."""
+    if unfreeze_visual:
+        for param in model.visual_encoder.parameters():
+            param.requires_grad = True
+    if unfreeze_audio:
+        for param in model.audio_encoder.parameters():
+            param.requires_grad = True
+
+
+def _trainable_param_groups(
+    model: LipSyncModel,
+    phase: int,
+    lr_head: float,
+    lr_encoder: float,
+) -> list[dict]:
+    """
+    Return optimizer param groups for the given phase.
+    Phase 1: fusion + classifier only (encoders frozen).
+    Phase 2: + audio encoder.
+    Phase 3: full model (visual + audio encoders).
+    """
+    head_params = [
+        model.projection.parameters(),
+        model.cross_modal.parameters(),
+        model.temporal.parameters(),
+        model.classifier.parameters(),
+    ]
+    if model.artifact_detector is not None:
+        head_params.append(model.artifact_detector.parameters())
+
+    if phase == 1:
+        return [{"params": [p for params in head_params for p in params], "lr": lr_head}]
+    if phase == 2:
+        groups = [{"params": [p for params in head_params for p in params], "lr": lr_head}]
+        groups.append({"params": model.audio_encoder.parameters(), "lr": lr_encoder})
+        return groups
+    # phase 3: full model
+    groups = [{"params": [p for params in head_params for p in params], "lr": lr_head}]
+    groups.append({"params": model.audio_encoder.parameters(), "lr": lr_encoder})
+    groups.append({"params": model.visual_encoder.parameters(), "lr": lr_encoder})
+    return groups
 
 
 def train_epoch(
@@ -35,6 +122,8 @@ def train_epoch(
     contrastive_weight: float = 0.1,
     contrastive_temperature: float = 0.07,
     contrastive_fake_margin: float = 0.10,
+    sync_weight: float = 0.0,
+    sync_shift_frames: Tuple[int, ...] = (5, 10, 15),
     verbose: bool = True,
 ) -> Tuple[float, float]:
     """Train for one epoch."""
@@ -75,6 +164,22 @@ def train_epoch(
             fake_margin=contrastive_fake_margin,
         )
         loss = bce_loss + contrastive_weight * contrastive_loss
+
+        # Sync contrastive (alignment): (video, correct_audio) vs (video, shifted_audio); real samples only.
+        if sync_weight > 0 and sync_shift_frames and (labels >= 0.5).any():
+            shifts = [s for s in sync_shift_frames if s != 0] + [-s for s in sync_shift_frames if s != 0]
+            shift = random.choice(shifts) if shifts else 0
+            if shift != 0:
+                audio_shifted = _shift_audio(audio, shift)
+                _, aux_neg = model(visual, audio_shifted, return_aux=True)  # type: ignore[assignment]
+                sync_loss = sync_contrastive_loss(
+                    aux["visual_tokens"],
+                    aux["audio_tokens"],
+                    [aux_neg["audio_tokens"]],
+                    real_mask=(labels >= 0.5),
+                    temperature=contrastive_temperature,
+                )
+                loss = loss + sync_weight * sync_loss
 
         # Backward pass
         loss.backward()
@@ -245,6 +350,18 @@ def main() -> None:
         default=0.10,
         help="Margin for fake-pair contrastive separation",
     )
+    parser.add_argument(
+        "--sync-weight",
+        type=float,
+        default=0.2,
+        help="Weight for sync contrastive loss (video vs shifted-audio). 0 to disable. Default 0.2.",
+    )
+    parser.add_argument(
+        "--sync-shift-frames",
+        type=str,
+        default="5,10,15",
+        help="Comma-separated frame shifts for sync negatives (e.g. 5,10,15). Default 5,10,15.",
+    )
     parser.add_argument("--device", type=str, default=None, help="Device (cuda/mps/cpu)")
     parser.add_argument("--val-split", type=float, default=0.2, help="Validation split ratio")
     parser.add_argument("--resume", type=Path, default=None, help="Resume from checkpoint")
@@ -255,12 +372,64 @@ def main() -> None:
         help="Disable face detection (uses center crop - NOT recommended for production)",
     )
     parser.add_argument(
+        "--use-augmentation",
+        action="store_true",
+        help="Apply data augmentation (flip, rotation, color jitter, noise, speed) to the training split.",
+    )
+    parser.add_argument(
+        "--preprocessed-dir",
+        type=Path,
+        default=None,
+        help="Optional path to precomputed tensors directory (manifest.jsonl).",
+    )
+    parser.add_argument(
+        "--storage-format",
+        type=str,
+        default="npy",
+        choices=["npy", "lmdb", "zarr"],
+        help="Storage backend when --preprocessed-dir is provided.",
+    )
+    parser.add_argument(
         "--early-stopping-patience",
         type=int,
         default=None,
         help="Early stopping patience based on accuracy (stop if accuracy doesn't improve for N epochs). If None, training continues for all epochs.",
     )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help=(
+            "DataLoader worker processes. Safe to set >0 when using --preprocessed-dir "
+            "(no MediaPipe in hot path). Keep 0 when training from raw video (MediaPipe "
+            "is not fork-safe)."
+        ),
+    )
+    parser.add_argument(
+        "--no-freeze",
+        action="store_true",
+        help="Disable phased encoder freezing; train full model from epoch 0.",
+    )
+    parser.add_argument(
+        "--freeze-phase1-end",
+        type=int,
+        default=5,
+        help="End epoch of Phase 1 (fusion + classifier only). Epochs 0 to this-1. Default 5.",
+    )
+    parser.add_argument(
+        "--freeze-phase2-end",
+        type=int,
+        default=15,
+        help="End epoch of Phase 2 (+ audio encoder). Phase 3 (full model) from this epoch. Default 15.",
+    )
+    parser.add_argument(
+        "--lr-encoder",
+        type=float,
+        default=1e-5,
+        help="Learning rate for encoders when unfrozen in Phase 2/3. Default 1e-5.",
+    )
     args = parser.parse_args()
+    args.sync_shift_frames = tuple(int(x.strip()) for x in args.sync_shift_frames.split(",") if x.strip())
 
     # Device
     device = get_device(args.device)
@@ -282,10 +451,19 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     # Datasets
+    if args.preprocessed_dir:
+        logger.info(
+            "Using precomputed dataset: dir=%s format=%s",
+            args.preprocessed_dir,
+            args.storage_format,
+        )
     full_dataset = LipSyncDataset(
-        args.data_dir, require_face_detection=not args.no_face_detection
+        args.data_dir,
+        require_face_detection=not args.no_face_detection,
+        preprocessed_dir=args.preprocessed_dir,
+        storage_format=args.storage_format,
     )
-    if args.no_face_detection:
+    if args.no_face_detection and not args.preprocessed_dir:
         logger.warning(
             "⚠️  Face detection disabled - using center crop. This is NOT recommended for production training!"
         )
@@ -293,9 +471,22 @@ def main() -> None:
     val_size = int(dataset_size * args.val_split)
     train_size = dataset_size - val_size
 
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        full_dataset, [train_size, val_size]
+    train_subset, val_subset = torch.utils.data.random_split(
+        full_dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(42),
     )
+    if args.use_augmentation:
+        logger.info("Data augmentation enabled for training split")
+        train_dataset = AugmentedLipSyncDataset(
+            data_dir=args.data_dir,
+            base_dataset=full_dataset,
+            indices=list(train_subset.indices),
+            apply_augmentation=True,
+        )
+    else:
+        train_dataset = ModeOverrideSubset(train_subset, train_mode=True)
+    val_dataset = ModeOverrideSubset(val_subset, train_mode=False)
 
     logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
@@ -304,17 +495,19 @@ def main() -> None:
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,  # Set to 2-4 if you have multiple cores
+        num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
         collate_fn=safe_collate,
+        persistent_workers=args.num_workers > 0,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
         collate_fn=safe_collate,
+        persistent_workers=args.num_workers > 0,
     )
 
     # Model
@@ -323,9 +516,28 @@ def main() -> None:
     logger.info(f"Model created with {param_count:,} parameters")
     logger.info(f"Model moved to device: {next(model.parameters()).device}")
 
+    use_phases = not args.no_freeze
+    phase1_end = int(args.freeze_phase1_end)
+    phase2_end = int(args.freeze_phase2_end)
+    if use_phases:
+        logger.info(
+            "Phased freezing: Phase 1 (fusion+classifier) epochs 0–%d | "
+            "Phase 2 (+audio encoder) %d–%d | Phase 3 (full model) %d+",
+            phase1_end - 1, phase1_end, phase2_end - 1, phase2_end,
+        )
+        logger.info("  Encoder LR when unfrozen: %s", args.lr_encoder)
+
     # Loss and optimizer (logits)
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    if use_phases:
+        _freeze_encoder(model, freeze_visual=True, freeze_audio=True)
+        optimizer = torch.optim.Adam(
+            _trainable_param_groups(model, 1, args.lr, args.lr_encoder)
+        )
+        logger.info("Phase 1: training fusion + classifier only (encoders frozen)")
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=5
     )
@@ -339,17 +551,38 @@ def main() -> None:
         logger.info(f"Loading checkpoint from {args.resume}")
         checkpoint = torch.load(args.resume, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_epoch = checkpoint.get("epoch", 0) + 1
         best_val_loss = checkpoint.get("best_val_loss", float("inf"))
         best_val_acc = checkpoint.get("best_val_acc", 0.0)
         epochs_without_improvement = checkpoint.get("epochs_without_improvement", 0)
-        
-        # Try to load scheduler state if available (for ReduceLROnPlateau, this tracks internal state)
-        if "scheduler_state_dict" in checkpoint:
-            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            logger.info("Loaded scheduler state from checkpoint")
-        
+
+        if use_phases:
+            # Set freeze state and rebuild optimizer for current phase (optimizer state not restored).
+            if start_epoch < phase1_end:
+                _freeze_encoder(model, freeze_visual=True, freeze_audio=True)
+                optimizer = torch.optim.Adam(
+                    _trainable_param_groups(model, 1, args.lr, args.lr_encoder)
+                )
+            elif start_epoch < phase2_end:
+                _unfreeze_encoder(model, unfreeze_visual=False, unfreeze_audio=True)
+                optimizer = torch.optim.Adam(
+                    _trainable_param_groups(model, 2, args.lr, args.lr_encoder)
+                )
+            else:
+                _unfreeze_encoder(model, unfreeze_visual=True, unfreeze_audio=True)
+                optimizer = torch.optim.Adam(
+                    _trainable_param_groups(model, 3, args.lr, args.lr_encoder)
+                )
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode="min", factor=0.5, patience=5
+            )
+            logger.info("Resume with phased training: optimizer/scheduler recreated for current phase")
+        else:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            if "scheduler_state_dict" in checkpoint:
+                scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                logger.info("Loaded scheduler state from checkpoint")
+
         # Check if best_model_accuracy.pth exists and has better accuracy than resume checkpoint
         best_acc_path = args.output_dir / "best_model_accuracy.pth"
         if best_acc_path.exists():
@@ -361,7 +594,7 @@ def main() -> None:
                     logger.info(f"Found better accuracy in best_model_accuracy.pth: {best_val_acc:.2%}")
             except Exception as e:
                 logger.warning(f"Could not load best_model_accuracy.pth: {e}")
-        
+
         logger.info(f"Resuming from epoch {start_epoch}")
         logger.info(f"Best validation loss so far: {best_val_loss:.4f}")
         logger.info(f"Best validation accuracy so far: {best_val_acc:.2%}")
@@ -371,8 +604,28 @@ def main() -> None:
     logger.info("Starting training...")
     logger.info(f"Training for {args.epochs} epochs with batch size {args.batch_size}")
     logger.info(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
-    
+
     for epoch in range(start_epoch, args.epochs):
+        # Phase transitions (phased freezing)
+        if use_phases and epoch == phase1_end:
+            _unfreeze_encoder(model, unfreeze_visual=False, unfreeze_audio=True)
+            optimizer = torch.optim.Adam(
+                _trainable_param_groups(model, 2, args.lr, args.lr_encoder)
+            )
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode="min", factor=0.5, patience=5
+            )
+            logger.info("Phase 2: unfroze audio encoder (epochs %d–%d)", phase1_end, phase2_end - 1)
+        if use_phases and epoch == phase2_end:
+            _unfreeze_encoder(model, unfreeze_visual=True, unfreeze_audio=True)
+            optimizer = torch.optim.Adam(
+                _trainable_param_groups(model, 3, args.lr, args.lr_encoder)
+            )
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode="min", factor=0.5, patience=5
+            )
+            logger.info("Phase 3: full model training (epochs %d–%d)", phase2_end, args.epochs - 1)
+
         # Train
         train_loss, train_acc = train_epoch(
             model,
@@ -384,6 +637,8 @@ def main() -> None:
             contrastive_weight=args.contrastive_weight,
             contrastive_temperature=args.contrastive_temperature,
             contrastive_fake_margin=args.contrastive_fake_margin,
+            sync_weight=getattr(args, "sync_weight", 0.0),
+            sync_shift_frames=getattr(args, "sync_shift_frames", (5, 10, 15)),
             verbose=args.verbose,
         )
 

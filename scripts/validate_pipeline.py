@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
 """
-Validate the full lip-sync detection pipeline on a dataset with real/ and fake/ folders.
+Validate the lip-sync pipeline: either on **video files** (full pipeline) or on a
+**preprocessed dataset** (Zarr, NPY, LMDB; model-only, no face detection).
 
-Uses the same inference entrypoint as production (Predictor.predict_from_upload) so that
-long-video, multi-face, mouth-motion checks, and verdict logic are all exercised.
+Modes:
+  1. Video mode (default): --data_root with real/ and fake/ folders.
+     Uses the same entrypoint as production (Predictor.predict_from_upload).
+  2. Preprocessed mode: --preprocessed_dir with manifest + samples (Zarr/NPY/LMDB).
+     Runs the model only on precomputed mouth crops and mel spectrograms.
 
-Label convention (used everywhere: CSV, metrics, confusion matrix, ROC):
-    - real (authentic)  -> 0
-    - fake (manipulated)-> 1
-    Ground truth: from folder (real/ -> 0, fake/ -> 1) or --label real|fake.
-    Predicted: from pipeline verdict (real -> 0, fake -> 1; uncertain -> 0 if confidence>=0.5 else 1).
-    Metrics: positive class = fake (1); precision/recall/F1 and ROC are for detecting fake.
+Label convention (everywhere): real=0, fake=1. Metrics: positive class = fake (1).
 
 Usage::
 
+    # Video mode (full pipeline)
     python scripts/validate_pipeline.py --data_root /path/to/dataset --output_dir ./results
     python scripts/validate_pipeline.py --data_root ./data/eval --output_dir ./results --model weights/best_model.pth
+    python scripts/validate_pipeline.py --data_root /path/to/large_eval --output_dir ./results --resume --save_every 500
 
-Dataset layout::
+    # Preprocessed mode (Zarr / NPY / LMDB)
+    python scripts/validate_pipeline.py --preprocessed_dir ./data/precomputed --storage_format zarr --model weights/best_model.pth --output_dir ./results_zarr
+    python scripts/validate_pipeline.py --preprocessed_dir ./data/precomputed --storage_format zarr --model weights/best_model.pth --output_dir ./results --resume --save_every 500 -n 1000
 
-    data_root/
-        real/    <- videos with ground_truth=0 (real)
-        fake/    <- videos with ground_truth=1 (fake)
+Dataset layouts::
+
+    Video:   data_root/real/ and data_root/fake/ (or --label real|fake for single folder)
+    Zarr:    preprocessed_dir/manifest.jsonl + preprocessed_dir/samples.zarr/
+    NPY:     manifest.jsonl + .npy files per sample
+    LMDB:    manifest.jsonl + samples.lmdb
 
 Outputs: predictions.csv, metrics.json, confusion_matrix.png, roc_curve.png,
          high_confidence_errors.csv
@@ -41,6 +47,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import torch
 from fastapi import UploadFile
 from sklearn.metrics import (
     accuracy_score,
@@ -64,6 +71,8 @@ logging.getLogger("app").setLevel(logging.WARNING)
 from app.config import get_settings
 from app.core.device import get_device
 from app.inference.predictor import Predictor
+from app.models.lip_sync_model import LipSyncModel
+from app.training.dataset import LipSyncDataset
 
 
 # -----------------------------------------------------------------------------
@@ -367,18 +376,182 @@ def create_predictor(settings=None, model_path_override: Path | None = None) -> 
 
 
 # -----------------------------------------------------------------------------
+# Preprocessed validation (Zarr / NPY / LMDB)
+# -----------------------------------------------------------------------------
+
+def _run_preprocessed_validation(args) -> None:
+    """Run model-only validation on preprocessed dataset. Manifest: 1=real, 0=fake; we use gt 0=real, 1=fake for metrics."""
+    preprocessed_dir = args.preprocessed_dir.resolve()
+    if not preprocessed_dir.is_dir():
+        print(f"Preprocessed dir not found: {preprocessed_dir}", file=sys.stderr)
+        sys.exit(1)
+    if args.model is None:
+        print("--model is required for preprocessed validation.", file=sys.stderr)
+        sys.exit(1)
+
+    output_dir = resolve_path(args.output_dir, must_exist=False)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_dir / "predictions_checkpoint.csv"
+    predictions_path = output_dir / "predictions.csv"
+
+    dataset = LipSyncDataset(
+        data_dir=preprocessed_dir,
+        preprocessed_dir=preprocessed_dir,
+        storage_format=args.storage_format,
+        video_frames=args.video_frames,
+        audio_frames=args.audio_frames,
+        require_face_detection=False,
+    )
+    n_total = len(dataset)
+    if n_total == 0:
+        print("No samples in preprocessed dataset.", file=sys.stderr)
+        sys.exit(1)
+
+    indices = list(range(n_total))
+    if args.n is not None:
+        indices = indices[: args.n]
+
+    existing_rows: list[dict] = []
+    if args.resume:
+        for path in (checkpoint_path, predictions_path):
+            if path.is_file():
+                try:
+                    existing_df = pd.read_csv(path)
+                    existing_rows = existing_df.to_dict("records")
+                    done_indices = {int(r["sample_idx"]) for r in existing_rows if "sample_idx" in r}
+                    indices = [i for i in indices if i not in done_indices]
+                    print(f"Resume: loaded {len(existing_rows)} previous results, {len(indices)} samples left.", file=sys.stderr)
+                except Exception as e:
+                    print(f"Resume: could not load {path}: {e}. Starting fresh.", file=sys.stderr)
+                break
+        else:
+            print("Resume: no existing predictions found. Starting fresh.", file=sys.stderr)
+
+    if not indices:
+        print("No samples left to process.")
+        df = pd.DataFrame(existing_rows)
+        metrics = compute_metrics(df)
+        with open(output_dir / "metrics.json", "w") as f:
+            json.dump(metrics, f, indent=2)
+        print(f"Metrics recomputed on {len(df)} existing rows. Exiting.")
+        sys.exit(0)
+
+    device = get_device(args.device)
+    model_path = args.model.resolve()
+    if not model_path.is_file():
+        model_path = ROOT / args.model
+    if not model_path.is_file():
+        print(f"Model not found: {args.model}", file=sys.stderr)
+        sys.exit(1)
+
+    model = LipSyncModel(detect_artifacts=True).to(device)
+    state = torch.load(model_path, map_location=device, weights_only=False)
+    if isinstance(state, dict):
+        if "model_state_dict" in state:
+            state = state["model_state_dict"]
+        elif "state_dict" in state:
+            state = state["state_dict"]
+    model.load_state_dict(state, strict=True)
+    model.eval()
+
+    rows = list(existing_rows)
+    done_count = 0
+    with torch.no_grad():
+        for batch_start in tqdm(range(0, len(indices), args.batch_size), desc="Inference", unit="batch"):
+            batch_indices = indices[batch_start : batch_start + args.batch_size]
+            batch_data = []
+            for idx in batch_indices:
+                sample = dataset.get_item(idx, train_mode_override=False)
+                if sample is not None:
+                    visual, audio, label = sample
+                    batch_data.append((idx, visual.unsqueeze(0), audio.unsqueeze(0), label.unsqueeze(0)))
+            if not batch_data:
+                continue
+            idx_list = [x[0] for x in batch_data]
+            visual = torch.cat([x[1] for x in batch_data], dim=0).to(device)
+            audio = torch.cat([x[2] for x in batch_data], dim=0).to(device)
+            labels_batch = torch.cat([x[3] for x in batch_data], dim=0)
+            logits = model(visual, audio)
+            probs = torch.sigmoid(logits).cpu().numpy()
+            labels_np = labels_batch.cpu().numpy()
+            for i, idx in enumerate(idx_list):
+                gt_manifest = int(labels_np[i])
+                ground_truth = 0 if gt_manifest == 1 else 1
+                prob_real = float(probs[i])
+                predicted_label = 0 if prob_real >= 0.5 else 1
+                correct = 1 if predicted_label == ground_truth else 0
+                rows.append({
+                    "sample_idx": idx,
+                    "ground_truth": ground_truth,
+                    "ground_truth_name": "real" if ground_truth == 0 else "fake",
+                    "predicted_label": predicted_label,
+                    "confidence": prob_real,
+                    "manipulation_probability": 1.0 - prob_real,
+                    "correct": correct,
+                })
+                done_count += 1
+            if args.save_every and done_count > 0 and (done_count - len(idx_list)) // args.save_every < done_count // args.save_every:
+                pd.DataFrame(rows).to_csv(checkpoint_path, index=False)
+
+    df = pd.DataFrame(rows)
+    df.to_csv(predictions_path, index=False)
+    if checkpoint_path.is_file():
+        try:
+            checkpoint_path.unlink()
+        except OSError:
+            pass
+    df_high_conf = df[((df["correct"] == 0) & (
+        (df["confidence"] > 0.9) | (df["manipulation_probability"] > 0.9)
+    ))]
+    df_high_conf.to_csv(output_dir / "high_confidence_errors.csv", index=False)
+    metrics = compute_metrics(df)
+    with open(output_dir / "metrics.json", "w") as f:
+        json.dump(metrics, f, indent=2)
+    save_confusion_matrix_png(df, output_dir / "confusion_matrix.png")
+    save_roc_curve_png(df, output_dir / "roc_curve.png")
+
+    print("\n" + "=" * 60)
+    print("  Preprocessed validation results")
+    print("=" * 60)
+    print(f"  Total samples   : {len(df)}")
+    print(f"  Accuracy        : {metrics['accuracy']:.4f}")
+    print(f"  Precision       : {metrics['precision']:.4f}")
+    print(f"  Recall          : {metrics['recall']:.4f}")
+    print(f"  F1-score        : {metrics['f1_score']:.4f}")
+    print(f"  ROC AUC         : {metrics['roc_auc']:.4f}")
+    print(f"  Confusion matrix: TN={metrics['confusion_matrix']['tn']} FP={metrics['confusion_matrix']['fp']} "
+          f"FN={metrics['confusion_matrix']['fn']} TP={metrics['confusion_matrix']['tp']}")
+    print("=" * 60)
+    print(f"Outputs: {output_dir}")
+
+
+# -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Validate full lip-sync pipeline on real/ and fake/ dataset.",
+        description="Validate lip-sync pipeline on videos (full pipeline) or preprocessed Zarr/NPY/LMDB (model-only).",
     )
     parser.add_argument(
         "--data_root",
         type=Path,
-        required=True,
-        help="Root folder containing real/ and fake/ subfolders with videos.",
+        default=None,
+        help="Root folder with real/ and fake/ subfolders (video mode). Required if not using --preprocessed_dir.",
+    )
+    parser.add_argument(
+        "--preprocessed_dir",
+        type=Path,
+        default=None,
+        help="Preprocessed dataset dir (manifest.jsonl + samples.zarr/.npy/lmdb). Use for Zarr/NPY/LMDB validation.",
+    )
+    parser.add_argument(
+        "--storage_format", "--storage-format",
+        type=str,
+        choices=["zarr", "npy", "lmdb"],
+        default="zarr",
+        dest="storage_format",
+        help="Preprocessed storage format when using --preprocessed_dir (default: zarr).",
     )
     parser.add_argument(
         "--output_dir",
@@ -390,35 +563,53 @@ def main() -> None:
         "--model",
         type=Path,
         default=None,
-        help="Path to model weights (default: from config).",
+        help="Path to model weights (default: from config). Required for --preprocessed_dir.",
     )
     parser.add_argument(
         "-n",
         type=int,
         default=None,
-        help="Limit number of videos (for quick runs).",
+        help="Limit number of samples or videos (for quick runs).",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=16,
+        help="Batch size for preprocessed mode only (default: 16).",
+    )
+    parser.add_argument(
+        "--video_frames",
+        type=int,
+        default=32,
+        help="Frames per clip for preprocessed mode (must match data; default 32).",
+    )
+    parser.add_argument(
+        "--audio_frames",
+        type=int,
+        default=128,
+        help="Audio frames for preprocessed mode (must match data; default 128).",
     )
     parser.add_argument(
         "--real_dir",
         type=str,
         default="real",
-        help="Subfolder name for real/authentic videos (default: real).",
+        help="Subfolder name for real/authentic videos (default: real). Video mode only.",
     )
     parser.add_argument(
         "--fake_dir",
         type=str,
         default="fake",
-        help="Subfolder name for fake/manipulated videos (default: fake).",
+        help="Subfolder name for fake/manipulated videos (default: fake). Video mode only.",
     )
     parser.add_argument(
         "--real_only",
         action="store_true",
-        help="Only run on videos in data_root/real_dir (all ground truth = real).",
+        help="Only run on videos in data_root/real_dir (all ground truth = real). Video mode only.",
     )
     parser.add_argument(
         "--fake_only",
         action="store_true",
-        help="Only run on videos in data_root/fake_dir (all ground truth = fake).",
+        help="Only run on videos in data_root/fake_dir (all ground truth = fake). Video mode only.",
     )
     parser.add_argument(
         "--label",
@@ -426,7 +617,25 @@ def main() -> None:
         choices=["real", "fake"],
         default=None,
         metavar="real|fake",
-        help="Single folder of videos: data_root contains only real or only fake (no real/fake subdirs).",
+        help="Single folder of videos: data_root contains only real or only fake (no real/fake subdirs). Video mode only.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from existing output_dir predictions; skip already-processed items.",
+    )
+    parser.add_argument(
+        "--save_every",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Save progress every N samples (use with --resume to recover from interrupt).",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device (cuda, mps, cpu). Default from config.",
     )
     args = parser.parse_args()
 
@@ -435,7 +644,14 @@ def main() -> None:
     if args.label and (args.real_only or args.fake_only):
         parser.error("Use only one of --real_only, --fake_only, or --label.")
 
-    # Resolve paths: both absolute and relative work; relative tries project root then cwd
+    # Preprocessed mode: Zarr / NPY / LMDB
+    if args.preprocessed_dir is not None:
+        _run_preprocessed_validation(args)
+        return
+
+    # Video mode: require data_root
+    if args.data_root is None:
+        parser.error("Provide --data_root (video mode) or --preprocessed_dir (Zarr/NPY/LMDB mode).")
     data_root = resolve_path(args.data_root, must_exist=True)
     output_dir = resolve_path(args.output_dir, must_exist=False)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -465,7 +681,28 @@ def main() -> None:
         sys.exit(1)
     if args.n is not None:
         videos = videos[: args.n]
-    print(f"Found {len(videos)} videos (real={sum(1 for _, g in videos if g == 0)}, fake={sum(1 for _, g in videos if g == 1)})")
+
+    # Resume: load existing predictions and skip already-done videos
+    existing_rows: list[dict] = []
+    checkpoint_path = output_dir / "predictions_checkpoint.csv"
+    predictions_path = output_dir / "predictions.csv"
+    if args.resume:
+        for path in (checkpoint_path, predictions_path):
+            if path.is_file():
+                try:
+                    existing_df = pd.read_csv(path)
+                    existing_rows = existing_df.to_dict("records")
+                    done_paths = {str(r["video_path"]) for r in existing_rows}
+                    videos = [(p, gt) for p, gt in videos if str(p) not in done_paths]
+                    print(f"Resume: loaded {len(existing_rows)} previous results, {len(videos)} videos left to process.", file=sys.stderr)
+                except Exception as e:
+                    print(f"Resume: could not load {path}: {e}. Starting fresh.", file=sys.stderr)
+                break
+        else:
+            if args.resume:
+                print("Resume: no existing predictions found. Starting fresh.", file=sys.stderr)
+
+    print(f"Found {len(videos)} videos to process (real={sum(1 for _, g in videos if g == 0)}, fake={sum(1 for _, g in videos if g == 1)})")
 
     # Load predictor (full pipeline config)
     try:
@@ -474,16 +711,18 @@ def main() -> None:
         print(e, file=sys.stderr)
         sys.exit(1)
 
-    rows: list[dict] = []
+    rows: list[dict] = list(existing_rows)
     failed_paths: list[str] = []
 
-    for video_path, ground_truth in tqdm(videos, desc="Inference", unit="video"):
+    for idx, (video_path, ground_truth) in enumerate(tqdm(videos, desc="Inference", unit="video")):
         try:
             t0 = time.perf_counter()
             result = run_full_pipeline_sync(predictor, video_path)
             t1 = time.perf_counter()
             row = extract_row(video_path, ground_truth, result, t1 - t0)
             rows.append(row)
+            if args.save_every and (idx + 1) % args.save_every == 0:
+                pd.DataFrame(rows).to_csv(checkpoint_path, index=False)
         except Exception as e:
             failed_paths.append(str(video_path))
             tqdm.write(f"FAILED {video_path}: {e}")
@@ -507,6 +746,11 @@ def main() -> None:
     # CSV
     df.to_csv(output_dir / "predictions.csv", index=False)
     df_high_conf_errors.to_csv(output_dir / "high_confidence_errors.csv", index=False)
+    if checkpoint_path.is_file():
+        try:
+            checkpoint_path.unlink()
+        except OSError:
+            pass
 
     # Plots
     save_confusion_matrix_png(df, output_dir / "confusion_matrix.png")

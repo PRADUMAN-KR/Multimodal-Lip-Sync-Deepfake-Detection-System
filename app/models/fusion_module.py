@@ -6,8 +6,9 @@ from torch import Tensor, nn
 
 class CrossModalAttention(nn.Module):
     """
-    Cross-modal attention: Video attends to Audio, Audio attends to Video,
-    then fuse into a single sequence.
+    Gated cross-modal attention: Video attends to Audio, Audio attends to Video,
+    then modality gating blends the two (trust video more when audio is noisy,
+    trust audio when lips are occluded).
 
     Inputs:
         visual_emb: (B, T_v, D_e)
@@ -38,8 +39,15 @@ class CrossModalAttention(nn.Module):
             dropout=dropout,
             batch_first=True,
         )
-        self.fuse = nn.Sequential(
+        # Modality gate: sigmoid(Linear([v_out, a_out])) -> blend v_out vs a_out per token
+        self.gate = nn.Sequential(
             nn.Linear(2 * embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, 1),
+            nn.Sigmoid(),
+        )
+        self.fuse = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
             nn.ReLU(inplace=True),
         )
 
@@ -72,8 +80,10 @@ class CrossModalAttention(nn.Module):
         a_attended, _ = self.a2v_attn(audio_emb, visual_emb, visual_emb)
         a_out = audio_emb + a_attended
 
-        # Fuse
-        fused = torch.cat([v_out, a_out], dim=-1)
+        # Gated fusion: gate * v_out + (1 - gate) * a_out (per-token modality weighting)
+        gate_input = torch.cat([v_out, a_out], dim=-1)  # (B, T, 2*D_e)
+        g = self.gate(gate_input)  # (B, T, 1)
+        fused = g * v_out + (1.0 - g) * a_out  # (B, T, D_e)
         return self.fuse(fused)
 
 

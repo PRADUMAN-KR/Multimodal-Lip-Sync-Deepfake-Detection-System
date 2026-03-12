@@ -116,9 +116,12 @@ class AudioEncoder(nn.Module):
         in_channels: int = 1,
         base_channels: int = 64,
         dropout: float = 0.1,
+        preserve_audio_temporal: bool = True,
     ) -> None:
         super().__init__()
         self.feature_dim = feature_dim
+        # When True: layer3 stride (2,1) -> T'≈T/4. When False: (2,2) -> T'≈T/8 (original).
+        self.preserve_audio_temporal = preserve_audio_temporal
 
         # Stem: larger kernel and stride in time to quickly aggregate
         # local temporal context while keeping frequency reasonably resolved.
@@ -138,12 +141,13 @@ class AudioEncoder(nn.Module):
 
         # ResNet‑like stages. We mostly downsample along frequency and
         # are conservative along time to preserve sync information.
+        layer3_stride = (2, 1) if preserve_audio_temporal else (2, 2)
         self.layer1 = _ResidualBlock(base_channels, base_channels, stride=(1, 1))
         self.layer2 = _ResidualBlock(base_channels, base_channels * 2, stride=(2, 2))
         self.layer3 = _ResidualBlock(
             base_channels * 2,
             base_channels * 4,
-            stride=(2, 2),
+            stride=layer3_stride,  # (2,1) keeps more T for lip-sync; (2,2) original
         )
         self.layer4 = _ResidualBlock(
             base_channels * 4,
@@ -194,7 +198,9 @@ class AudioEncoder(nn.Module):
 
         out = self.dropout(out)
 
-        # Average pool over frequency dimension, keep time.
-        out = out.mean(dim=2)  # (B, D_a, T')
+        # Pool over frequency only; preserve temporal resolution (AdaptiveAvgPool2d (1, T')).
+        t_len = out.size(3)
+        out = torch.nn.functional.adaptive_avg_pool2d(out, (1, t_len))
+        out = out.squeeze(2)  # (B, D_a, T')
         return out
 

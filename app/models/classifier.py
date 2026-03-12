@@ -13,8 +13,9 @@ class ClassificationHead(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Dropout(p=dropout),
+            nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, 1),
         )
 

@@ -191,8 +191,11 @@ class VisualEncoder(nn.Module):
         out = self.dropout(out)
         feature_map = out
 
-        # Spatial average pooling, keep temporal dimension.
-        pooled = out.mean(dim=[3, 4])  # (B, D_v, T')
+        # Preserve full temporal resolution: pool only over spatial dims (H, W).
+        # AdaptiveAvgPool3d((T', 1, 1)) keeps T' intact for lip-sync (errors in 2–3 frames).
+        t_len = out.size(2)
+        pooled = torch.nn.functional.adaptive_avg_pool3d(out, (t_len, 1, 1))
+        pooled = pooled.squeeze(-1).squeeze(-1)  # (B, D_v, T')
         if return_map:
             return pooled, feature_map
         return pooled
