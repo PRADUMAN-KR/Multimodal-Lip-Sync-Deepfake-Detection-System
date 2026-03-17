@@ -356,34 +356,50 @@ def main() -> None:
     skipped = 0
     written = 0
 
-    # If re-running on a directory where some samples are already precomputed,
-    # we can skip those to support incremental additions to 0_real/1_fake.
-    def _already_precomputed(idx: int, video_path: Path, label: int) -> bool:
-        sample_id = f"{idx:08d}"
-        if args.storage_format == "zarr" and zarr_root is not None:
-            # Groups are keyed by sample_id under the Zarr root.
-            return sample_id in zarr_root
-        if args.storage_format == "npy":
-            v_dir = "visual_full" if args.precompute_mode == "full_sequence" else "visual"
-            a_dir = "audio_full" if args.precompute_mode == "full_sequence" else "audio"
-            visual_rel = Path(v_dir) / f"{sample_id}.npy"
-            audio_rel = Path(a_dir) / f"{sample_id}.npy"
-            visual_out = output_dir / visual_rel
-            audio_out = output_dir / audio_rel
-            return visual_out.exists() and audio_out.exists()
-        # LMDB: currently always overwrite; no incremental skip.
-        return False
+    # ------------------------------------------------------------------
+    # Incremental skip: read existing manifest to find already-processed
+    # source paths.  New samples get indices continuing from the last run.
+    # This is SOURCE-PATH-BASED (not index-based) so it is stable even
+    # when new clips are added and the enumeration order shifts.
+    # ------------------------------------------------------------------
+    existing_source_paths: set[str] = set()
+    next_idx = 0
+    manifest_open_mode = "w"
 
-    # Build worker jobs
+    if manifest_path.exists():
+        with manifest_path.open("r", encoding="utf-8") as _mf:
+            for _line in _mf:
+                _line = _line.strip()
+                if not _line:
+                    continue
+                try:
+                    _entry = json.loads(_line)
+                    existing_source_paths.add(_entry["source_path"])
+                    try:
+                        next_idx = max(next_idx, int(_entry["id"]) + 1)
+                    except (ValueError, TypeError, KeyError):
+                        pass
+                except (json.JSONDecodeError, KeyError):
+                    pass
+        if existing_source_paths:
+            manifest_open_mode = "a"
+            logger.info(
+                "Incremental run: %d samples already in manifest, "
+                "continuing idx from %d",
+                len(existing_source_paths),
+                next_idx,
+            )
+
+    # Build worker jobs — only for clips not already in the manifest
     jobs: list[tuple[int, str, int, str, str, str, int, int, bool, float]] = []
-    for idx, (video_path, label) in enumerate(samples):
-        if _already_precomputed(idx, video_path, label):
+    new_idx = next_idx
+    for video_path, label in samples:
+        if str(video_path) in existing_source_paths:
             skipped += 1
-            logger.info("Skipping already-precomputed sample idx=%d (%s)", idx, video_path)
             continue
         jobs.append(
             (
-                idx,
+                new_idx,
                 str(video_path),
                 int(label),
                 str(output_dir),
@@ -395,6 +411,7 @@ def main() -> None:
                 float(args.target_fps),
             )
         )
+        new_idx += 1
 
     workers = int(args.workers or 0)
     use_pool = workers > 1
@@ -403,7 +420,7 @@ def main() -> None:
     else:
         logger.info("Using single-process preprocessing")
 
-    with manifest_path.open("w", encoding="utf-8") as mf:
+    with manifest_path.open(manifest_open_mode, encoding="utf-8") as mf:
         if use_pool:
             with mp.Pool(processes=workers) as pool:
                 for status, idx, rec, storage_item, err in tqdm(
@@ -434,17 +451,20 @@ def main() -> None:
                     mf.write(json.dumps(rec, ensure_ascii=True) + "\n")
                     written += 1
         else:
-            for idx, (video_path, label) in enumerate(
-                tqdm(samples, desc="Precomputing samples")
-            ):
-                if _already_precomputed(idx, video_path, label):
-                    skipped += 1
-                    logger.info(
-                        "Skipping already-precomputed sample idx=%d (%s)",
-                        idx,
-                        video_path,
-                    )
-                    continue
+            for job in tqdm(jobs, desc="Precomputing samples"):
+                (
+                    idx,
+                    video_path_str,
+                    label,
+                    _,
+                    _storage_format,
+                    _precompute_mode,
+                    _video_frames,
+                    _audio_frames,
+                    _strict,
+                    _fps,
+                ) = job
+                video_path = Path(video_path_str)
                 sample_id = f"{idx:08d}"
                 try:
                     rec, storage_item = _precompute_one(

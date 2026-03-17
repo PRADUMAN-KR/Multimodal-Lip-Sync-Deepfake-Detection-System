@@ -588,7 +588,7 @@ def main() -> None:
     )
 
     dataset_size = len(full_dataset)
-    val_size = int(dataset_size * 0.2)
+    val_size = int(dataset_size * 0.1)
     train_size = dataset_size - val_size
 
     train_subset, val_subset = torch.utils.data.random_split(

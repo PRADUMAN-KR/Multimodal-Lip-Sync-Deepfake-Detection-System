@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 class Settings(BaseModel):
     project_name: str = "Lip Sync Detection Service"
-    model_path: Path = Path("weights_finetune") / "best_model_f1.pth"
+    model_path: Path = Path("weights_finetune") / "best_model_accuracy.pth"
     device: str = "cuda"  # or "cpu"
     confidence_threshold: float = 0.5
     use_torchscript: bool = False
@@ -19,7 +19,7 @@ class Settings(BaseModel):
     refine_margin: float = 0.08
     refine_top_k: int = 2
     chunk_size: int = 32
-    chunk_stride: int = 16
+    chunk_stride: int = 8
     long_video_threshold_sec: float = 2.0
     max_total_frames: int = 900
 
@@ -67,7 +67,9 @@ def get_settings() -> Settings:
     """
     Return application settings.
 
-    In production, extend this to read from environment variables,
-    secrets managers, or configuration files rather than hardcoding.
+    MODEL_PATH can override model_path (path to .pth weights).
     """
-    return Settings()
+    kwargs = {}
+    if env_path := os.environ.get("MODEL_PATH"):
+        kwargs["model_path"] = Path(env_path)
+    return Settings(**kwargs)

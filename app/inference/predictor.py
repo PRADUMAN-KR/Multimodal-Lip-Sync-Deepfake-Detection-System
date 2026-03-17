@@ -45,7 +45,7 @@ class Predictor:
         refine_margin: float = 0.08,
         refine_top_k: int = 2,
         chunk_size: int = 32,
-        chunk_stride: int = 16,
+        chunk_stride: int = 8,
         long_video_threshold_sec: float = 2.0,
         max_total_frames: int = 900,
         # ── Confidence Margin Rule ─────────────────────────────────────────

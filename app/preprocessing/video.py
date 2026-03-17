@@ -442,7 +442,7 @@ def preprocess_video_tracks(
 def preprocess_video_tracks_chunked(
     path: Path,
     chunk_size: int = 32,
-    stride: int = 16,
+    stride: int = 8,
     max_faces: int = 5,
     max_tracks: int = 3,
     crop_size: Tuple[int, int] = (96, 96),
@@ -459,7 +459,7 @@ def preprocess_video_tracks_chunked(
     Using ``target_fps`` makes each chunk represent the same wall-clock duration
     regardless of source video FPS.  At the default target_fps=15:
       - chunk_size=32 frames  →  32/15 ≈ 2.1 s per model window
-      - stride=16 frames      →  16/15 ≈ 1.1 s step between windows
+      - stride=8 frames       →  8/15 ≈ 0.53 s step between windows
 
     This replaces ``preprocess_video_tracks`` for inference on videos longer
     than a single model window (T=32).
@@ -467,7 +467,7 @@ def preprocess_video_tracks_chunked(
     Args:
         path:             Video file.
         chunk_size:       Frames per model input window (must match model T, default 32).
-        stride:           Step between consecutive windows (default 16 = 50 % overlap).
+        stride:           Step between consecutive windows (default 8 = 75 % overlap).
         max_faces:        Max faces detected per frame.
         max_tracks:       Max face tracks retained.
         crop_size:        Mouth crop spatial size.
