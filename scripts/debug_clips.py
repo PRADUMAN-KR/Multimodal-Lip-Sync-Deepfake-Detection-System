@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import sys
 from pathlib import Path
 
 import cv2
@@ -7,7 +8,13 @@ import librosa
 import matplotlib.pyplot as plt
 import numpy as np
 import json
-import pandas as pd
+
+# Run from project root
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.training.dataset import LipSyncDataset
 
 
 def extract_audio_energy(path: Path, sr: int = 16000) -> np.ndarray:
@@ -88,6 +95,107 @@ def resolve_video_from_sample_idx(
     return Path(source_path)
 
 
+def _load_manifest_record(sample_idx: int, preprocessed_dir: Path) -> dict:
+    manifest_path = preprocessed_dir / "manifest.jsonl"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+
+    manifest: list[dict] = []
+    with manifest_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            manifest.append(json.loads(s))
+
+    if sample_idx < 0 or sample_idx >= len(manifest):
+        raise IndexError(f"sample_idx {sample_idx} out of range for manifest length {len(manifest)}")
+    return manifest[sample_idx]
+
+
+def export_exact_preprocessed_clip(
+    sample_idx: int,
+    preprocessed_dir: Path,
+    storage_format: str = "zarr",
+    video_frames: int = 32,
+    audio_frames: int = 128,
+    output_dir: Path = Path("debug_exact_clips"),
+    fps: float = 15.0,
+) -> Path:
+    """
+    Export the exact visual tensor used by preprocessed validation for sample_idx.
+    This uses the same dataset path as validate_pipeline preprocessed mode:
+    dataset.get_item(idx, train_mode_override=False).
+    """
+    record = _load_manifest_record(sample_idx, preprocessed_dir)
+    dataset = LipSyncDataset(
+        data_dir=preprocessed_dir,
+        preprocessed_dir=preprocessed_dir,
+        storage_format=storage_format,
+        video_frames=video_frames,
+        audio_frames=audio_frames,
+        require_face_detection=False,
+    )
+    item = dataset.get_item(sample_idx, train_mode_override=False)
+    if item is None:
+        raise RuntimeError(f"Could not load preprocessed sample {sample_idx}")
+
+    visual_t, audio_t, label_t = item
+    visual = visual_t.detach().cpu().numpy()  # (3, T, H, W)
+    audio = audio_t.detach().cpu().numpy()    # (1, 80, T_a)
+
+    if visual.ndim != 4 or visual.shape[0] != 3:
+        raise ValueError(f"Unexpected visual tensor shape: {visual.shape}")
+
+    # Convert to uint8 frames (T, H, W, 3)
+    frames = np.transpose(visual, (1, 2, 3, 0))
+    if frames.max() <= 1.0:
+        frames = frames * 255.0
+    frames_u8 = np.clip(frames, 0, 255).astype(np.uint8)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"sample_{sample_idx:05d}"
+    out_video = output_dir / f"{stem}.mp4"
+    out_visual = output_dir / f"{stem}_visual.npy"
+    out_audio = output_dir / f"{stem}_audio.npy"
+    out_meta = output_dir / f"{stem}_meta.json"
+
+    h, w = int(frames_u8.shape[1]), int(frames_u8.shape[2])
+    writer = cv2.VideoWriter(
+        str(out_video),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (w, h),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Could not open video writer for: {out_video}")
+
+    for frame in frames_u8:
+        writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    writer.release()
+
+    np.save(out_visual, visual, allow_pickle=False)
+    np.save(out_audio, audio, allow_pickle=False)
+
+    meta = {
+        "sample_idx": sample_idx,
+        "source_path": record.get("source_path"),
+        "key": record.get("key"),
+        "precompute_mode": record.get("precompute_mode"),
+        "label_manifest": record.get("label"),
+        "visual_shape": list(visual.shape),
+        "audio_shape": list(audio.shape),
+        "video_path": str(out_video),
+    }
+    with out_meta.open("w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+    print(f"Exported exact preprocessed clip video: {out_video}")
+    print(f"Saved tensors: {out_visual}, {out_audio}")
+    print(f"Saved metadata: {out_meta}")
+    return out_video
+
+
 def plot_sync_debug(video_path: Path, title_suffix: str | None = None) -> None:
     print(f"Debugging video: {video_path}")
     audio_energy = extract_audio_energy(video_path)
@@ -153,6 +261,31 @@ def main() -> None:
         help="Optional: results dir containing predictions.csv. Used only for context; "
         "not strictly required just to plot.",
     )
+    parser.add_argument(
+        "--export_exact_clip",
+        action="store_true",
+        help="When using --sample_idx + --preprocessed_dir, export the exact "
+        "preprocessed clip used by validation to debug_exact_clips/.",
+    )
+    parser.add_argument(
+        "--storage_format",
+        type=str,
+        choices=["zarr", "npy", "lmdb"],
+        default="zarr",
+        help="Storage format for preprocessed data when exporting exact clip.",
+    )
+    parser.add_argument(
+        "--video_frames",
+        type=int,
+        default=32,
+        help="video_frames used in preprocessed validation (default: 32).",
+    )
+    parser.add_argument(
+        "--audio_frames",
+        type=int,
+        default=128,
+        help="audio_frames used in preprocessed validation (default: 128).",
+    )
     args = parser.parse_args()
 
     if args.video_path is None and args.sample_idx is None:
@@ -167,6 +300,17 @@ def main() -> None:
     else:
         video_path = args.video_path
         title_suffix = video_path.name if video_path is not None else None
+
+    if args.export_exact_clip:
+        if args.sample_idx is None or args.preprocessed_dir is None:
+            parser.error("--export_exact_clip requires --sample_idx and --preprocessed_dir.")
+        export_exact_preprocessed_clip(
+            sample_idx=args.sample_idx,
+            preprocessed_dir=args.preprocessed_dir,
+            storage_format=args.storage_format,
+            video_frames=args.video_frames,
+            audio_frames=args.audio_frames,
+        )
 
     if video_path is None:
         parser.error("Could not resolve video path.")
