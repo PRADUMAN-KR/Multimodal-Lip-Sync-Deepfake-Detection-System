@@ -76,6 +76,8 @@ def create_start_app_handler(app: FastAPI):
                 audio_energy_low_threshold=settings.audio_energy_low_threshold,
                 weak_real_gate=settings.weak_real_gate,
                 weak_real_window_threshold=settings.weak_real_window_threshold,
+                fake_vote_gate=settings.fake_vote_gate,
+                fake_vote_min_windows=settings.fake_vote_min_windows,
             )
 
     return start_app

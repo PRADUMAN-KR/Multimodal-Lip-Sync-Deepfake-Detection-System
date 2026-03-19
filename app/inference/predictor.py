@@ -41,13 +41,13 @@ class Predictor:
         uncertainty_margin: float = 0.05,
         confidence_smoothing: str = "median",
         trim_ratio: float = 0.1,
-        max_tracks: int = 3,
+        max_tracks: int = 6,
         refine_margin: float = 0.08,
         refine_top_k: int = 2,
         chunk_size: int = 32,
         chunk_stride: int = 8,
         long_video_threshold_sec: float = 2.0,
-        max_total_frames: int = 900,
+        max_total_frames: Optional[int] = None,
         # ── Confidence Margin Rule ─────────────────────────────────────────
         confidence_margin: float = 0.10,
         # ── Output Calibration ────────────────────────────────────────────
@@ -65,6 +65,13 @@ class Predictor:
         # ── Sparse-real-signal guard ──────────────────────────────────────
         weak_real_gate: float = 0.08,
         weak_real_window_threshold: float = 0.30,
+        # ── Temporal-minority fake gate ───────────────────────────────────
+        # If at least this fraction of speech-active windows score as fake
+        # AND the absolute count of clearly-fake windows meets the floor,
+        # force the verdict to FAKE even when the overall confidence is high
+        # (catches localised manipulation such as 20s in a 2-min video).
+        fake_vote_gate: float = 0.15,
+        fake_vote_min_windows: int = 5,
     ):
         self.device = device
         self.confidence_threshold = float(confidence_threshold)
@@ -81,7 +88,9 @@ class Predictor:
         self.chunk_size = int(chunk_size)
         self.chunk_stride = int(chunk_stride)
         self.long_video_threshold_sec = float(long_video_threshold_sec)
-        self.max_total_frames = int(max_total_frames)
+        self.max_total_frames = (
+            int(max_total_frames) if max_total_frames is not None else None
+        )
 
         # ── Confidence Margin Rule ─────────────────────────────────────────────
         self.confidence_margin = float(max(0.0, confidence_margin))
@@ -118,6 +127,15 @@ class Predictor:
         self.weak_real_gate = float(max(0.0, weak_real_gate))
         self.weak_real_window_threshold = float(max(0.0, weak_real_window_threshold))
 
+        # ── Temporal-minority fake gate ────────────────────────────────────────
+        # Percentage-policy gate: even when the median/weighted confidence is
+        # above the threshold (most windows look real), flip to FAKE when a
+        # meaningful minority of speech-active windows score as fake.
+        # fake_vote_gate        – minimum ratio  (default 10 %)
+        # fake_vote_min_windows – minimum absolute count (noise floor guard)
+        self.fake_vote_gate = float(max(0.0, min(1.0, fake_vote_gate)))
+        self.fake_vote_min_windows = int(max(1, fake_vote_min_windows))
+
         model = LipSyncModel()
 
         if not model_path.is_file():
@@ -136,7 +154,7 @@ class Predictor:
             "Multi-track selection config: uncertainty_margin=%.3f, confidence_margin=%.3f, "
             "confidence_smoothing=%s, trim_ratio=%.2f, max_tracks=%d, "
             "refine_margin=%.3f, refine_top_k=%d, "
-            "chunk_size=%d, chunk_stride=%d, long_video_threshold_sec=%.1f, max_total_frames=%d",
+            "chunk_size=%d, chunk_stride=%d, long_video_threshold_sec=%.1f, max_total_frames=%s",
             self.uncertainty_margin,
             self.confidence_margin,
             self.confidence_smoothing,
@@ -653,14 +671,21 @@ class Predictor:
                 stability = float(tr.get("stability", 0.0))
                 hits = int(tr.get("hits", 0))
                 consecutive_miss_max = int(tr.get("consecutive_miss_max", 0))
+                track_start_frame = int(tr.get("track_start_frame", 0))
+                track_end_frame = int(tr.get("track_end_frame", total_v_frames - 1))
 
                 agg_conf, chunk_confs = self._run_chunked_inference(
                     chunks, chunk_starts, audio_np_full, total_v_frames
                 )
 
-                # Speaking activity from first chunk (representative)
+                # Use a chunk near the middle of the track's active span for
+                # speaking activity (more representative than always using chunk 0).
+                mid_chunk_idx = len(chunks) // 2
                 speaking_score = self._speaking_alignment_score(
-                    chunks[0], self._align_audio_chunk(audio_np_full, chunk_starts[0], total_v_frames)
+                    chunks[mid_chunk_idx],
+                    self._align_audio_chunk(
+                        audio_np_full, chunk_starts[mid_chunk_idx], total_v_frames
+                    ),
                 )
                 selection_score = (
                     0.65 * agg_conf + 0.20 * stability + 0.15 * speaking_score
@@ -668,10 +693,10 @@ class Predictor:
                 is_real = agg_conf >= self.confidence_threshold
 
                 logger.info(
-                    "Track %d: %d chunks, agg_conf=%.4f, stability=%.3f, "
-                    "speaking=%.3f, selection_score=%.4f, is_real=%s",
-                    track_id, len(chunks), agg_conf, stability,
-                    speaking_score, selection_score, is_real,
+                    "Track %d: %d chunks, frames=%d–%d, agg_conf=%.4f, "
+                    "stability=%.3f, speaking=%.3f, selection_score=%.4f, is_real=%s",
+                    track_id, len(chunks), track_start_frame, track_end_frame,
+                    agg_conf, stability, speaking_score, selection_score, is_real,
                 )
 
                 track_results.append({
@@ -684,6 +709,8 @@ class Predictor:
                     "stability": stability,
                     "hits": hits,
                     "total_frames": total_v_frames,
+                    "track_start_frame": track_start_frame,
+                    "track_end_frame": track_end_frame,
                     "speaking_activity": float(speaking_score),
                     "selection_score": float(selection_score),
                     "window_confidences": [float(c) for c in chunk_confs],
@@ -719,65 +746,82 @@ class Predictor:
             _conf_gap = 1.0
             confidence_margin_uncertain = False
 
-        # ── Per-chunk timeline across full clip ───────────────────────────────
-        # For each chunk index shared across tracks, pick the winner
-        max_chunks = max(len(tr["window_confidences"]) for tr in sorted_tracks)
+        # ── Per-chunk timeline across full clip (time-based selection) ───────────
+        # After Fix 1 (no pre-fill) + Fix 2 (absolute chunk_starts), every
+        # window_span[i][0] is an ABSOLUTE video frame number, not a local
+        # crop-array index.  We therefore group all windows from all tracks by
+        # their absolute start frame and, for each real-time position, select
+        # the single best track — instead of comparing chunk index 0 of track A
+        # with chunk index 0 of track B (which map to completely different times).
         total_chunks = sum(len(tr["window_confidences"]) for tr in sorted_tracks)
+        max_chunks = max(
+            (len(tr["window_confidences"]) for tr in sorted_tracks), default=0
+        )
         track_chunks_map: Dict[int, List[np.ndarray]] = {
             int(tr["track_id"]): tr["chunks"] for tr in chunked_tracks
         }
+
+        # Build a flat index: abs_start_frame → list of (track_result, chunk_idx)
+        _by_abs_start: Dict[int, List[Tuple]] = {}
+        for tr in sorted_tracks:
+            for i, span in enumerate(tr["window_spans"]):
+                abs_start = int(span[0])
+                if abs_start not in _by_abs_start:
+                    _by_abs_start[abs_start] = []
+                _by_abs_start[abs_start].append((tr, i))
+
         chunk_window_results: List[Dict[str, Any]] = []
-        for c_idx in range(max_chunks):
-            candidates = [
-                tr for tr in sorted_tracks
-                if len(tr["window_confidences"]) > c_idx
-            ]
-            if not candidates:
+        for abs_start in sorted(_by_abs_start.keys()):
+            time_candidates = _by_abs_start[abs_start]
+            if not time_candidates:
                 continue
-            win = max(
-                candidates,
-                key=lambda tr: (
-                    0.75 * float(tr["window_confidences"][c_idx])
-                    + 0.25 * float(tr.get("stability", 0.0))
+
+            # Pick the track with the highest score AT THIS SPECIFIC TIME POSITION.
+            win_tr, win_i = max(
+                time_candidates,
+                key=lambda t: (
+                    0.75 * float(t[0]["window_confidences"][t[1]])
+                    + 0.25 * float(t[0].get("stability", 0.0))
                 ),
             )
-            v_start = int(win["window_spans"][c_idx][0])
-            v_end = int(win["window_spans"][c_idx][1])
-            win_conf = float(win["window_confidences"][c_idx])
-            win_track_id = int(win["track_id"])
-            win_speaking = float(win.get("speaking_activity", 0.5))
+            v_start = int(win_tr["window_spans"][win_i][0])
+            v_end = int(win_tr["window_spans"][win_i][1])
+            win_conf = float(win_tr["window_confidences"][win_i])
+            win_track_id = int(win_tr["track_id"])
+            win_speaking = float(win_tr.get("speaking_activity", 0.5))
             win_chunks = track_chunks_map.get(win_track_id, [])
-            if c_idx < len(win_chunks):
+            if win_i < len(win_chunks):
                 try:
                     audio_chunk = self._align_audio_chunk(
                         audio_np_full, v_start, total_v_frames
                     )
                     win_speaking = float(
-                        self._speaking_alignment_score(win_chunks[c_idx], audio_chunk)
+                        self._speaking_alignment_score(win_chunks[win_i], audio_chunk)
                     )
                 except Exception:
-                    # Keep previously computed per-track speaking score if chunk scoring fails.
                     pass
-            
-            # Map VAD mask to this window's time range
+
+            # Map VAD mask to this window's absolute time range
             time_start_sec = float(v_start / max(1.0, fps))
             time_end_sec = float(v_end / max(1.0, fps))
-            # VAD mask is in mel-spectrogram frame space (hop_length=160 @ 16kHz)
-            # Map video time to mel frame indices
             mel_hop_ms = 160.0 / 16000.0 * 1000.0  # ~10ms per mel frame
             mel_start_idx = int(time_start_sec * 1000.0 / mel_hop_ms)
             mel_end_idx = int(time_end_sec * 1000.0 / mel_hop_ms)
             mel_start_idx = max(0, min(mel_start_idx, len(vad_mask) - 1))
             mel_end_idx = max(mel_start_idx + 1, min(mel_end_idx, len(vad_mask)))
-            window_vad_coverage = float(np.mean(vad_mask[mel_start_idx:mel_end_idx])) if mel_end_idx > mel_start_idx else 0.5
-            
+            window_vad_coverage = (
+                float(np.mean(vad_mask[mel_start_idx:mel_end_idx]))
+                if mel_end_idx > mel_start_idx
+                else 0.5
+            )
+
             chunk_window_results.append({
-                "window_index": int(c_idx),
+                "window_index": len(chunk_window_results),
                 "frame_start": v_start,
                 "frame_end": v_end,
                 "time_start_sec": round(time_start_sec, 3),
                 "time_end_sec": round(time_end_sec, 3),
-                "selected_track_id": int(win["track_id"]),
+                "selected_track_id": win_track_id,
                 "confidence": win_conf,
                 "speaking_activity": win_speaking,
                 "vad_coverage": round(window_vad_coverage, 3),
@@ -864,10 +908,116 @@ class Predictor:
             _temporal_drift = 0.0
             temporal_confidence_drop = False
 
+        # ── Speech-weighted fake vote ratio ───────────────────────────────────
+        # Old approach: hard binary speech mask (>= 0.45) + unweighted binary vote.
+        # Problem: windows just below the speech threshold are excluded entirely,
+        # and a barely-fake window counts the same as a strongly-fake one.
+        #
+        # New approach: soft speech weights + confidence-distance weighting.
+        #   speech_weight  = how active speech is (0.2 floor so silence still counts)
+        #   fake_intensity = how far below threshold the window scored (0 if real)
+        #   fake_vote_ratio = sum(speech_weight * fake_intensity) / sum(speech_weight)
+        #
+        # This means:
+        #   - A silent window with conf=0.01 contributes at weight 0.2 (small but not zero)
+        #   - A speaking window with conf=0.01 contributes at full weight (1.0)
+        #   - A barely-fake window (conf=0.49) scores near-zero intensity → low contribution
+        #   - A strongly-fake window (conf=0.01) scores high intensity → high contribution
+
+        # Use VAD weights when available for the speech signal
+        if window_vad_weights is not None and len(window_vad_weights) == len(window_confs):
+            vad_arr = np.clip(np.asarray(window_vad_weights, dtype=np.float32), 0.0, 1.0)
+            combined_speech_w = np.clip(0.7 * vad_arr + 0.3 * speech_arr, 0.0, 1.0)
+        else:
+            combined_speech_w = np.clip(speech_arr, 0.0, 1.0)
+
+        speech_weights = np.clip(0.2 + 0.8 * combined_speech_w, 0.2, 1.0)
+
+        # fake_intensity: how fake each window is (0 if conf >= threshold, else gap)
+        fake_intensity = np.clip(self.confidence_threshold - conf_arr, 0.0, 1.0)
+
+        denom_w = float(speech_weights.sum())
+        fake_vote_ratio = (
+            float(np.dot(speech_weights, fake_intensity) / denom_w)
+            if denom_w > 1e-8 else 0.0
+        )
+        # Normalise to [0,1] range so it's comparable to the old ratio
+        # (max fake_intensity is confidence_threshold, e.g. 0.5 when threshold=0.5)
+        fake_vote_ratio = float(np.clip(fake_vote_ratio / max(self.confidence_threshold, 1e-6), 0.0, 1.0))
+
+        # ── Strict fake evidence (ratio + temporal continuity) ────────────────
+        # Uses the original binary speech mask (>= 0.45) intentionally — this is
+        # a hard safety gate, not a sensitivity tool.
+        #
+        # Risk with ratio-only approach:
+        #   Many short scattered noise windows (blinks, occlusions) could each
+        #   individually score below threshold, pushing ratio to 0.70+ and
+        #   falsely triggering "strict" even though no real fake segment exists.
+        #
+        # Fix: require BOTH a high ratio AND a minimum consecutive run of fake
+        # windows in the temporal sequence.  Scattered noise produces short
+        # isolated runs; real manipulation produces long contiguous runs.
+        #   min_consecutive = 8 windows × stride(8) ≈ 4 s of continuous faking
         speech_mask = speech_arr >= 0.45
         vote_src = conf_arr[speech_mask] if np.any(speech_mask) else conf_arr
-        fake_vote_ratio = float(np.mean(vote_src < self.confidence_threshold)) if vote_src.size else 1.0
-        strict_fake_evidence = fake_vote_ratio >= 0.70
+        _fake_ratio_hard = (
+            float(np.mean(vote_src < self.confidence_threshold))
+            if vote_src.size else 0.0
+        )
+
+        # Compute max consecutive fake windows in the FULL temporal sequence
+        # (not just speech-masked) so ordering is preserved.
+        _max_consec_fake = 0
+        _cur_run = 0
+        for _c in conf_arr:
+            if _c < self.confidence_threshold:
+                _cur_run += 1
+                _max_consec_fake = max(_max_consec_fake, _cur_run)
+            else:
+                _cur_run = 0
+
+        # Strict fake: high ratio + sustained continuous fake segment (≥ 8 windows)
+        strict_fake_evidence = bool(
+            _fake_ratio_hard >= 0.70
+            and _max_consec_fake >= 8
+        )
+
+        # ── Temporal-minority fake gate ────────────────────────────────────────
+        # The median/weighted confidence aggregation can mask a localised fake
+        # segment (e.g. 20 s manipulated in a 2-min video) because the majority
+        # of windows are real and pull the average up.  This gate catches it by
+        # counting the *fraction* of speech-active windows that score below the
+        # threshold (fake_vote_ratio) and the *absolute* count of clearly-fake
+        # windows (strong_fake) as an independent noise-floor guard.
+        #
+        # Example — 2-min video, 20 s manipulated:
+        #   total windows ≈ 226,  fake windows ≈ 37
+        #   fake_vote_ratio ≈ 0.16  ≥  gate (0.10)  → FAKE  ✓
+        #
+        # Example — 1-2 occlusion/blink windows (noise):
+        #   strong_fake ≈ 2  <  min_windows (5)     → stays REAL  ✓
+        meaningful_fake_evidence = (
+            fake_vote_ratio >= self.fake_vote_gate
+            and strong_fake >= self.fake_vote_min_windows
+        )
+        if meaningful_fake_evidence:
+            # Force confidence below threshold so the verdict becomes FAKE.
+            # Use 1 - fake_vote_ratio as a calibrated fake-confidence signal so
+            # a 50 % fake_vote_ratio gives confidence ≈ 0.50 (ambiguous), while
+            # a 90 % fake_vote_ratio gives confidence ≈ 0.10 (strongly fake).
+            fake_signal_confidence = float(1.0 - fake_vote_ratio)
+            # Blend with existing final_confidence so we don't completely ignore
+            # the model's own estimate (70 % fake_signal, 30 % model).
+            final_confidence = float(0.3 * final_confidence + 0.7 * fake_signal_confidence)
+            final_confidence = min(final_confidence, self.confidence_threshold - 1e-4)
+            logger.info(
+                "Temporal-minority fake gate triggered: "
+                "fake_vote_ratio=%.3f (gate=%.2f), strong_fake=%d (min=%d) → "
+                "confidence forced to %.4f (FAKE)",
+                fake_vote_ratio, self.fake_vote_gate,
+                strong_fake, self.fake_vote_min_windows,
+                final_confidence,
+            )
 
         final_is_real = final_confidence >= self.confidence_threshold
         window_consensus_uncertain = False
@@ -1033,14 +1183,14 @@ class Predictor:
                 for seg in speaker_timeline
             )
             detail = (
-                f"Long video ({dur_str}, {max_chunks} chunks analyzed). "
+                f"Long video ({dur_str}, {total_chunks} chunks analyzed). "
                 f"Speaker turn-taking detected: {spans_str}. "
                 f"Final verdict window-aggregated (confidence={final_confidence:.4f})."
             )
             selection_uncertain = False
         elif mouth_motion_override_applied:
             detail = (
-                f"Long video ({dur_str}, {max_chunks} chunks). "
+                f"Long video ({dur_str}, {total_chunks} chunks). "
                 f"Mouth motion check → uncertain "
                 f"(audio={mouth_check['audio_energy']:.1f} dB, "
                 f"motion={mouth_check['mouth_motion_energy']:.5f}): "
@@ -1050,7 +1200,7 @@ class Predictor:
             )
         elif sparse_real_guard_applied:
             detail = (
-                f"Long video ({dur_str}, {max_chunks} chunks). "
+                f"Long video ({dur_str}, {total_chunks} chunks). "
                 f"Sparse-real-signal guard: model confidence very low ({_conf_before_sparse:.4f}) "
                 f"but window {int(np.argmax(window_confs))} showed real-like signal "
                 f"(conf={_max_window_conf:.3f}). "
@@ -1058,14 +1208,14 @@ class Predictor:
             )
         elif window_consensus_uncertain:
             detail = (
-                f"Long video ({dur_str}, {max_chunks} chunks). "
+                f"Long video ({dur_str}, {total_chunks} chunks). "
                 f"Window consensus is mixed (strong_real={strong_real}, strong_fake={strong_fake}, "
                 f"fake_vote_ratio={fake_vote_ratio:.2f}). "
                 f"Returning conservative REAL verdict (confidence={final_confidence:.4f})."
             )
         elif selection_uncertain:
             detail = (
-                f"Long video ({dur_str}, {max_chunks} chunks). "
+                f"Long video ({dur_str}, {total_chunks} chunks). "
                 f"Track selection uncertain (margin={selection_margin:.4f})."
             )
         else:
@@ -1076,7 +1226,7 @@ class Predictor:
             )
             detail = (
                 f"Long video ({dur_str}). "
-                f"Analyzed {max_chunks} chunk(s) across full clip. "
+                f"Analyzed {total_chunks} chunk(s) across full clip. "
                 f"Dominant speaker: track {best_track_id} "
                 f"(confidence={final_confidence:.4f}).{_drift_note}"
             )

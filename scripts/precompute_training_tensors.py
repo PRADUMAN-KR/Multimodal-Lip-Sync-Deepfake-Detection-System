@@ -95,7 +95,7 @@ def _precompute_one(
         frames = load_video_frames(
             video_path,
             load_all=True,
-            max_total_frames=900,
+            max_total_frames=None,
             target_fps=target_fps,
         )
         try:

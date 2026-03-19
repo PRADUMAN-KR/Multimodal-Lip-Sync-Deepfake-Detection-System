@@ -672,7 +672,7 @@ def detect_and_crop_mouth_tracks(
     max_tracks: int = 5,
     iou_threshold: float = 0.25,
     iou_threshold_relaxed: float = 0.12,
-    max_age: int = 3,
+    max_age: int = 15,
     min_stability: float = 0.35,
     min_detection_confidence: float = 0.3,
     min_tracking_confidence: float = 0.3,
@@ -683,7 +683,8 @@ def detect_and_crop_mouth_tracks(
     Improvements over basic IoU tracker:
     - Velocity extrapolation: predicted bbox used when detection is missed.
     - Grace period (max_age): track stays alive for N frames without a match
-      before being dropped, using a relaxed IoU threshold for re-association.
+      before being retired; expired tracks are saved (not deleted) so that
+      speakers who leave and return are all captured.
     - Backfilled interpolated crops for missed frames between two known detections.
     - Weighted stability score that penalises consecutive misses more than
       scattered ones.
@@ -771,11 +772,17 @@ def detect_and_crop_mouth_tracks(
         )
 
     # ── Track state ───────────────────────────────────────────────────────────
+    # `tracks`           – currently active (not yet expired) tracks.
+    # `completed_tracks` – tracks that exceeded max_age; saved here instead of
+    #                      deleted so that all speakers across the full video are
+    #                      captured (critical for long turn-taking videos).
+    #
     # Each track dict holds:
-    #   id, last_bbox, prev_bbox, velocity, crops (list, one per frame),
-    #   bbox_history (for backfill), hits, age, consecutive_miss,
-    #   max_consecutive_miss, miss_frame_indices
+    #   id, start_frame_idx, end_frame_idx,
+    #   last_bbox, velocity, crops (list, one per frame),
+    #   hits, age, consecutive_miss, max_consecutive_miss, miss_frame_indices
     tracks: List[dict] = []
+    completed_tracks: List[dict] = []
     next_id = 0
     total_frames = max(1, len(frames))
 
@@ -890,6 +897,7 @@ def detect_and_crop_mouth_tracks(
                 )  # type: ignore[assignment]
 
                 tr["last_bbox"] = new_bbox
+                tr["end_frame_idx"] = t_idx
                 tr["crops"].append(crop)
                 tr["hits"] += 1
                 tr["age"] = 0
@@ -915,7 +923,18 @@ def detect_and_crop_mouth_tracks(
                 )
                 tr["miss_frame_indices"].append(t_idx)
 
-        # ── Prune expired tracks ──────────────────────────────────────────────
+        # ── Retire expired tracks → completed_tracks (not deleted) ───────────
+        # Saving them ensures speakers who leave the frame are retained for the
+        # full-video inference, which is essential for turn-taking detection.
+        newly_expired = [tr for tr in tracks if tr["age"] > max_age]
+        for tr in newly_expired:
+            logger.debug(
+                "Track %d retired: hits=%d, frames=%d–%d, stability~=%.3f",
+                tr["id"], tr["hits"],
+                tr.get("start_frame_idx", 0), tr.get("end_frame_idx", t_idx),
+                tr["hits"] / max(1, tr.get("end_frame_idx", t_idx) - tr.get("start_frame_idx", 0) + 1),
+            )
+            completed_tracks.append(tr)
         tracks = [tr for tr in tracks if tr["age"] <= max_age]
 
         # ── Create new tracks for unmatched faces ─────────────────────────────
@@ -930,9 +949,16 @@ def detect_and_crop_mouth_tracks(
                 continue
             tr = {
                 "id": next_id,
+                "start_frame_idx": t_idx,
+                "end_frame_idx": t_idx,
                 "last_bbox": tuple(f["bbox"]),
                 "velocity": (0.0, 0.0, 0.0, 0.0),
-                "crops": [_center_crop(frame)] * t_idx + [crop],
+                # Only store crops from first real detection onward.
+                # No center-crop pre-fill: that created fake temporal continuity
+                # for tracks starting late in the video (a track created at frame
+                # 1796 would get 1796 placeholder frames, appearing to cover the
+                # whole video and winning every per-window selection).
+                "crops": [crop],
                 "hits": 1,
                 "age": 0,
                 "consecutive_miss": 0,
@@ -946,26 +972,44 @@ def detect_and_crop_mouth_tracks(
             next_id += 1
             tracks.append(tr)
 
+    # ── Combine completed + still-active tracks ───────────────────────────────
+    # Still-active tracks have their end_frame_idx set to the last frame where
+    # they were matched; ensure it is up to date.
+    for tr in tracks:
+        if "end_frame_idx" not in tr:
+            tr["end_frame_idx"] = total_frames - 1
+
+    all_tracks = completed_tracks + tracks
+
+    logger.info(
+        "Face tracking completed: %d total tracks (%d completed + %d still-active)",
+        len(all_tracks), len(completed_tracks), len(tracks),
+    )
+
     # ── Compute weighted stability and filter ─────────────────────────────────
     def _weighted_stability(tr: dict) -> float:
         """
-        Stability score in [0, 1].
+        Stability score in [0, 1] relative to the track's own active span.
+
+        Using the track's span (end - start + 1) instead of total_frames makes
+        the score fair for speakers who only appear for part of the video (e.g.,
+        turn-taking), so they are not penalised simply for not being in every frame.
 
         Penalties applied:
-        - Base: hits / total_frames
+        - Base: hits / span  (hits within the track's own active window)
         - Consecutive-miss penalty: each extra consecutive miss beyond 1
-          adds a multiplicative penalty.
+          applies a 15% relative penalty (capped at 50%).
         """
-        base = float(tr["hits"]) / total_frames
+        start = int(tr.get("start_frame_idx", 0))
+        end = int(tr.get("end_frame_idx", total_frames - 1))
+        span = max(1, end - start + 1)
+        base = float(tr["hits"]) / span
         max_consec = int(tr.get("max_consecutive_miss", 0))
         if max_consec <= 1:
             return base
-        # Each consecutive miss beyond 1 applies a 15% relative penalty.
         consec_penalty = min(0.5, (max_consec - 1) * 0.15)
         return float(base * (1.0 - consec_penalty))
 
-    logger.info("Face tracking completed: %d tracks created", len(tracks))
-    
     # Log detector usage summary
     total_detections = sum(detector_stats.values())
     if total_detections > 0:
@@ -973,7 +1017,7 @@ def detect_and_crop_mouth_tracks(
         pct_mp_bbox = (detector_stats["mp_bbox"] / total_detections) * 100
         pct_haar = (detector_stats["haar"] / total_detections) * 100
         pct_none = (detector_stats["none"] / total_detections) * 100
-        
+
         logger.info(
             "Detector usage summary (%d frames): FaceMesh=%.1f%% (%d), "
             "MP FaceDetection=%.1f%% (%d), Haar cascade=%.1f%% (%d), None=%.1f%% (%d)",
@@ -984,27 +1028,29 @@ def detect_and_crop_mouth_tracks(
             pct_none, detector_stats["none"],
         )
 
-    # Score, filter, sort
-    for tr in tracks:
+    # Score all tracks (completed + active)
+    for tr in all_tracks:
         tr["w_stability"] = _weighted_stability(tr)
 
-    viable = [tr for tr in tracks if tr["w_stability"] >= min_stability]
+    viable = [tr for tr in all_tracks if tr["w_stability"] >= min_stability]
     if not viable:
         # Fallback: keep best track regardless of threshold
-        viable = tracks
+        viable = all_tracks
         logger.warning(
-            "No tracks passed min_stability=%.2f; keeping %d best track(s)",
-            min_stability, min(1, len(viable)),
+            "No tracks passed min_stability=%.2f; keeping best %d track(s) from all %d",
+            min_stability, min(max_tracks, len(viable)), len(all_tracks),
         )
 
     tracks_sorted = sorted(viable, key=lambda tr: tr["w_stability"], reverse=True)[
         :max_tracks
     ]
     logger.info(
-        "Selected %d track(s): ids=%s, hits=%s, weighted_stability=%s",
+        "Selected %d track(s): ids=%s, hits=%s, span=%s, weighted_stability=%s",
         len(tracks_sorted),
         [tr["id"] for tr in tracks_sorted],
         [tr["hits"] for tr in tracks_sorted],
+        [f"{tr.get('start_frame_idx',0)}-{tr.get('end_frame_idx', total_frames-1)}"
+         for tr in tracks_sorted],
         [f"{tr['w_stability']:.3f}" for tr in tracks_sorted],
     )
 
@@ -1046,6 +1092,10 @@ def detect_and_crop_mouth_tracks(
                 "total_frames": total_frames,
                 "stability": float(tr["w_stability"]),
                 "consecutive_miss_max": int(tr.get("max_consecutive_miss", 0)),
+                # Frame range within the video where this speaker was active.
+                # Useful for audio alignment and turn-taking reporting.
+                "track_start_frame": int(tr.get("start_frame_idx", 0)),
+                "track_end_frame": int(tr.get("end_frame_idx", total_frames - 1)),
             }
         )
     return out
