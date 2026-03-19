@@ -1,7 +1,7 @@
-## 🎯 R2Plus1D-Sync-Defense-Resnet
 
-> Production-grade Multimodal Lip-Sync Deepfake Detection System  
-> Spatio-Temporal + Cross-Modal Attention Based Forgery Detection
+# Multimodal Lip Sync Deepfake Detection System
+
+A production-ready deep learning system for detecting audio-video synchronization mismatches (lip sync deepfakes) using multimodal learning.
 
 ---
 ## 🚀 Project Highlights
