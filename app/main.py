@@ -28,7 +28,7 @@ def get_application() -> FastAPI:
             "docs": "/docs",
             "openapi": "/openapi.json",
             "predict": "POST /api/lip-sync with multipart video file",
-            "async_predict": "POST /predict, GET /status/{job_id}, GET /result/{job_id}",
+            "async_predict": "POST /jobs, GET /result/{job_id}",
         }
 
     app.add_event_handler("startup", create_start_app_handler(app))

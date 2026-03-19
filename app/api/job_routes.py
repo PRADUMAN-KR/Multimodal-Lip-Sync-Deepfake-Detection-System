@@ -1,19 +1,35 @@
 import json
 from pathlib import Path
+from typing import Any
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile, status
 
 from ..core.logger import get_logger
 from ..db import database
 from ..services.job_service import JobService
 from ..utils.file_manager import save_upload_to_temp
-from .job_schemas import JobResultResponse, JobStatusResponse, PredictJobCreateResponse
+from .job_schemas import JobResultResponse, PredictJobCreateResponse
 
-router = APIRouter(tags=["jobs"])
+router = APIRouter(tags=["Asynchronous"])
 logger = get_logger(__name__)
 
+MINIMAL_RESULT_KEYS = {
+    "verdict",
+    "is_real",
+    "is_fake",
+    "confidence",
+    "manipulation_probability",
+    "detail",
+}
 
-@router.post("/predict", response_model=PredictJobCreateResponse)
+
+def _to_minimal_result(result: dict[str, Any] | None) -> dict[str, Any] | None:
+    if result is None:
+        return None
+    return {k: v for k, v in result.items() if k in MINIMAL_RESULT_KEYS}
+
+
+@router.post("/jobs", response_model=PredictJobCreateResponse)
 async def create_predict_job(
     request: Request,
     video_file: UploadFile = File(..., description="Video file containing face and audio"),
@@ -42,31 +58,14 @@ async def create_predict_job(
         session.close()
 
 
-@router.get("/status/{job_id}", response_model=JobStatusResponse)
-async def get_job_status(job_id: str) -> JobStatusResponse:
-    if database.SessionLocal is None:
-        raise HTTPException(status_code=503, detail="Database not ready")
-
-    session = database.SessionLocal()
-    try:
-        service = JobService(session)
-        job = service.get_job(job_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail="Job not found")
-        return JobStatusResponse(
-            job_id=job.job_id,
-            status=job.status.value,
-            input_path=job.input_path,
-            created_at=job.created_at,
-            updated_at=job.updated_at,
-            error=job.error,
-        )
-    finally:
-        session.close()
-
-
 @router.get("/result/{job_id}", response_model=JobResultResponse)
-async def get_job_result(job_id: str) -> JobResultResponse:
+async def get_job_result(
+    job_id: str,
+    include_debug: bool = Query(
+        default=False,
+        description="When true, returns full internal debug payload; otherwise returns minimal result fields.",
+    ),
+) -> JobResultResponse:
     if database.SessionLocal is None:
         raise HTTPException(status_code=503, detail="Database not ready")
 
@@ -84,6 +83,7 @@ async def get_job_result(job_id: str) -> JobResultResponse:
                 detail=f"Job not completed yet. Current status={job.status.value}",
             )
         parsed = json.loads(job.result) if job.result else None
-        return JobResultResponse(job_id=job.job_id, status=job.status.value, result=parsed, error=job.error)
+        response_result = parsed if include_debug else _to_minimal_result(parsed)
+        return JobResultResponse(job_id=job.job_id, status=job.status.value, result=response_result, error=job.error)
     finally:
         session.close()
