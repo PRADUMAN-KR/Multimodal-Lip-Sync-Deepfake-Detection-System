@@ -8,7 +8,7 @@ from .schemas import (
     LipSyncResponse,
 )
 
-router = APIRouter(tags=["lip-sync"])
+router = APIRouter(tags=["Lip Sync Detection System"])
 logger = get_logger(__name__)
 
 
@@ -61,39 +61,40 @@ async def check_lip_sync(
     return LipSyncResponse(**result)
 
 
-@router.post("/metrics/evaluate", response_model=BatchEvaluateResponse)
-async def evaluate_batch(body: BatchEvaluateRequest) -> BatchEvaluateResponse:
-    """Compute Precision, Recall, F1 and Accuracy over a labelled batch.
-
-    Supply a list of ``{predicted_is_fake, true_is_fake}`` pairs collected from
-    previous ``/lip-sync`` calls (plus any ground-truth labels you hold).
-    The positive class is **fake** (label 1), matching the standard deepfake-
-    detection convention.
-
-    Example request body::
-
-        {
-          "evaluations": [
-            {"predicted_is_fake": true,  "true_is_fake": true},
-            {"predicted_is_fake": false, "true_is_fake": false},
-            {"predicted_is_fake": true,  "true_is_fake": false}
-          ]
-        }
-    """
-    if not body.evaluations:
-        raise HTTPException(status_code=422, detail="evaluations list must not be empty.")
-
-    y_true = [int(e.true_is_fake) for e in body.evaluations]
-    y_pred = [int(e.predicted_is_fake) for e in body.evaluations]
-
-    metrics = compute_metrics(y_true, y_pred, positive_label=1)
-
-    logger.info(
-        "Batch evaluation: total=%d, precision=%.4f, recall=%.4f, f1=%.4f, accuracy=%.4f",
-        metrics["total"],
-        metrics["precision"],
-        metrics["recall"],
-        metrics["f1"],
-        metrics["accuracy"],
-    )
-    return BatchEvaluateResponse(**metrics)
+# NOTE: Disabled for now per product scope. Keep implementation for future use.
+# @router.post("/metrics/evaluate", response_model=BatchEvaluateResponse)
+# async def evaluate_batch(body: BatchEvaluateRequest) -> BatchEvaluateResponse:
+#     """Compute Precision, Recall, F1 and Accuracy over a labelled batch.
+#
+#     Supply a list of ``{predicted_is_fake, true_is_fake}`` pairs collected from
+#     previous ``/lip-sync`` calls (plus any ground-truth labels you hold).
+#     The positive class is **fake** (label 1), matching the standard deepfake-
+#     detection convention.
+#
+#     Example request body::
+#
+#         {
+#           "evaluations": [
+#             {"predicted_is_fake": true,  "true_is_fake": true},
+#             {"predicted_is_fake": false, "true_is_fake": false},
+#             {"predicted_is_fake": true,  "true_is_fake": false}
+#           ]
+#         }
+#     """
+#     if not body.evaluations:
+#         raise HTTPException(status_code=422, detail="evaluations list must not be empty.")
+#
+#     y_true = [int(e.true_is_fake) for e in body.evaluations]
+#     y_pred = [int(e.predicted_is_fake) for e in body.evaluations]
+#
+#     metrics = compute_metrics(y_true, y_pred, positive_label=1)
+#
+#     logger.info(
+#         "Batch evaluation: total=%d, precision=%.4f, recall=%.4f, f1=%.4f, accuracy=%.4f",
+#         metrics["total"],
+#         metrics["precision"],
+#         metrics["recall"],
+#         metrics["f1"],
+#         metrics["accuracy"],
+#     )
+#     return BatchEvaluateResponse(**metrics)

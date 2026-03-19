@@ -3,7 +3,9 @@ from fastapi import FastAPI
 from .config import get_settings
 from .core.device import get_device
 from .core.logger import get_logger
+from .db.database import init_db, init_engine
 from .inference.predictor import Predictor
+from .worker.worker import JobWorker
 
 
 logger = get_logger(__name__)
@@ -37,6 +39,8 @@ def create_start_app_handler(app: FastAPI):
         )
         app.state.settings = settings
         app.state.device = device
+        init_engine(settings.sqlite_db_url)
+        init_db()
 
         if not settings.model_path.is_file():
             logger.warning(
@@ -79,6 +83,15 @@ def create_start_app_handler(app: FastAPI):
                 fake_vote_gate=settings.fake_vote_gate,
                 fake_vote_min_windows=settings.fake_vote_min_windows,
             )
+        worker = None
+        if settings.run_embedded_worker and app.state.predictor is not None:
+            worker = JobWorker(
+                predictor=app.state.predictor,
+                poll_interval_sec=settings.worker_poll_interval_sec,
+                processing_timeout_sec=settings.worker_processing_timeout_sec,
+            )
+            worker.start()
+        app.state.worker = worker
 
     return start_app
 
@@ -87,6 +100,9 @@ def create_stop_app_handler(app: FastAPI):
     async def stop_app() -> None:
         # Add any resource cleanup here (e.g., closing pools)
         predictor: Predictor | None = getattr(app.state, "predictor", None)
+        worker: JobWorker | None = getattr(app.state, "worker", None)
+        if worker is not None:
+            await worker.stop()
         if predictor is not None:
             predictor.close()
         logger.info("Lip Sync Detection Service shutdown complete")
