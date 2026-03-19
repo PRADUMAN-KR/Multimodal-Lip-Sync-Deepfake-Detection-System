@@ -19,7 +19,7 @@ except ImportError:
 def _load_video_frames_pyav(
     path: Path,
     target_fps: float,
-    max_total_frames: int,
+    max_total_frames: Optional[int],
 ) -> np.ndarray:
     """
     Load video frames at target_fps using PyAV (FFmpeg bindings).
@@ -41,7 +41,11 @@ def _load_video_frames_pyav(
         duration_sec = 1e9  # assume very long if unknown
 
     expected_frames = int(duration_sec * target_fps)
-    target_count = min(expected_frames, max_total_frames)
+    target_count = (
+        expected_frames
+        if max_total_frames is None
+        else min(expected_frames, max_total_frames)
+    )
     target_times = [i / target_fps for i in range(target_count)]
 
     frames: List[np.ndarray] = []
@@ -148,7 +152,7 @@ def load_video_frames(
     path: Path,
     max_frames: int = 32,
     load_all: bool = False,
-    max_total_frames: int = 900,
+    max_total_frames: Optional[int] = None,
     target_fps: Optional[float] = None,
 ) -> np.ndarray:
     """
@@ -162,10 +166,11 @@ def load_video_frames(
         load_all:         When True (and target_fps=None), reads the entire video up
                           to ``max_total_frames``. Ignored when target_fps is set
                           (full video is always loaded in that mode).
-        max_total_frames: Hard safety cap on the number of OUTPUT frames to prevent
-                          OOM on very long videos.
-                          - target_fps=None  → caps raw frames  (900 ≈ 30 s @ 30 fps)
-                          - target_fps=15    → caps resampled frames (900 ≈ 60 s @ 15 fps)
+        max_total_frames: Optional safety cap on OUTPUT frames to prevent OOM on
+                          very long videos.
+                          - None             → no cap (load all frames)
+                          - target_fps=None  → caps raw frames
+                          - target_fps=15    → caps resampled frames
         target_fps:       When set, resample the video to this frame rate using PyAV
                           (FFmpeg).  PyAV handles duration, PTS, and codecs correctly,
                           so loaded frames are proportional to video duration regardless
@@ -176,14 +181,21 @@ def load_video_frames(
     """
     fps_mode = target_fps is not None
     if fps_mode:
-        mode_desc = f"target_fps={target_fps}, output_cap={max_total_frames}"
+        mode_desc = (
+            f"target_fps={target_fps}, output_cap={max_total_frames}"
+            if max_total_frames is not None
+            else f"target_fps={target_fps}, output_cap=none"
+        )
         limit = max_total_frames
     else:
         limit = max_total_frames if load_all else max_frames
-        mode_desc = f"full-clip cap={max_total_frames}" if load_all else f"first {max_frames} frames"
+        mode_desc = (
+            f"full-clip cap={max_total_frames}" if load_all and max_total_frames is not None
+            else ("full-clip cap=none" if load_all else f"first {max_frames} frames")
+        )
 
     logger.debug(
-        "Loading video frames from %s (mode=%s, limit=%d frames)",
+        "Loading video frames from %s (mode=%s, limit=%s frames)",
         path, mode_desc, limit,
     )
 
@@ -216,7 +228,7 @@ def load_video_frames(
                 f"Video has invalid properties (fps={native_fps}, frames={frame_count}): {path}"
             )
 
-        if load_all and frame_count > max_total_frames:
+        if load_all and max_total_frames is not None and frame_count > max_total_frames:
             duration_sec = frame_count / max(1.0, native_fps)
             logger.warning(
                 "Video has %d frames (%.1fs @ %.1ffps) but max_total_frames=%d. "
@@ -233,7 +245,7 @@ def load_video_frames(
         else:
             limit = max_frames
 
-        while len(frames) < limit:
+        while limit is None or len(frames) < limit:
             ret, frame = cap.read()
             if not ret:
                 consecutive_failures += 1
@@ -308,7 +320,7 @@ def preprocess_video(
     max_frames: int = 32,
     strict_face_detection: bool = False,
     target_fps: float = 15.0,
-    max_total_frames: int = 900,
+    max_total_frames: Optional[int] = None,
 ) -> np.ndarray:
     """
     Full video preprocessing with production-grade face detection.
@@ -324,7 +336,8 @@ def preprocess_video(
         target_fps:          Resample source video to this frame rate before any
                              other processing.  Ensures time-consistent inputs
                              regardless of source FPS (default 15 fps).
-        max_total_frames:    Safety cap on resampled frames loaded from disk.
+        max_total_frames:    Optional safety cap on resampled frames loaded from
+                             disk. None means no cap.
 
     Returns:
         (C, T, H, W) float32 - preprocessed video ready for model, where T = max_frames.
@@ -376,7 +389,7 @@ def preprocess_video_tracks(
     crop_size: Tuple[int, int] = (96, 96),
     max_frames: int = 32,
     target_fps: float = 15.0,
-    max_total_frames: int = 900,
+    max_total_frames: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     """
     Multi-subject preprocessing.
@@ -444,9 +457,9 @@ def preprocess_video_tracks_chunked(
     chunk_size: int = 32,
     stride: int = 8,
     max_faces: int = 5,
-    max_tracks: int = 3,
+    max_tracks: int = 6,
     crop_size: Tuple[int, int] = (96, 96),
-    max_total_frames: int = 900,
+    max_total_frames: Optional[int] = None,
     target_fps: float = 15.0,
 ) -> Tuple[List[Dict[str, Any]], float, int]:
     """
@@ -471,7 +484,8 @@ def preprocess_video_tracks_chunked(
         max_faces:        Max faces detected per frame.
         max_tracks:       Max face tracks retained.
         crop_size:        Mouth crop spatial size.
-        max_total_frames: Safety cap on resampled output frames (900 @ 15 fps ≈ 60 s).
+        max_total_frames: Optional safety cap on resampled output frames.
+                          None means no cap.
         target_fps:       Resample video to this frame rate before chunking so all
                           chunks represent consistent real-time durations (default 15).
 
@@ -483,8 +497,10 @@ def preprocess_video_tracks_chunked(
         - ``chunk_starts``       : list of int – resampled frame index each chunk starts at
         - ``hits``               : matched frames across full clip
         - ``total_frames``       : total resampled frames loaded
-        - ``stability``          : weighted stability score
+        - ``stability``          : weighted stability score (relative to track's own span)
         - ``consecutive_miss_max``: worst consecutive-miss streak
+        - ``track_start_frame``  : first video frame where this speaker was detected
+        - ``track_end_frame``    : last video frame where this speaker was detected
     """
     fps, _ = get_video_info(path)
 
@@ -517,10 +533,17 @@ def preprocess_video_tracks_chunked(
 
     out: List[Dict[str, Any]] = []
     for tr in raw_tracks:
-        crops = tr["crops"]  # (total_frames, H, W, C)
+        crops = tr["crops"]  # (span_length, H, W, C) — only covers active detection range
         N = crops.shape[0]
 
-        # Build sliding-window chunks
+        # Absolute video frame where this track's crops[0] starts.
+        # After the pre-fill removal in face_detection.py, crops[i] corresponds
+        # to absolute video frame (track_start_frame + i), not frame i.
+        track_abs_start: int = int(tr.get("track_start_frame", 0))
+
+        # Build sliding-window chunks with ABSOLUTE frame positions.
+        # chunk_starts[j] = absolute video frame where chunk j begins, so that
+        # audio alignment and cross-track time comparison are correct.
         chunks: List[np.ndarray] = []
         chunk_starts: List[int] = []
 
@@ -530,10 +553,11 @@ def preprocess_video_tracks_chunked(
             clip = window.astype("float32") / 255.0
             clip = np.transpose(clip, (3, 0, 1, 2))  # (C, chunk_size, H, W)
             chunks.append(clip)
-            chunk_starts.append(int(start))
+            # Store the ABSOLUTE video frame index, not the local crop index.
+            chunk_starts.append(int(track_abs_start + start))
             start += stride
 
-        # If the video is shorter than chunk_size, pad and keep as single chunk
+        # If the track is shorter than chunk_size, pad and keep as single chunk
         if not chunks:
             window = crops[:N]
             if N < chunk_size:
@@ -542,11 +566,11 @@ def preprocess_video_tracks_chunked(
             clip = window.astype("float32") / 255.0
             clip = np.transpose(clip, (3, 0, 1, 2))
             chunks.append(clip)
-            chunk_starts.append(0)
+            chunk_starts.append(int(track_abs_start))  # absolute start of this track
 
         logger.debug(
-            "Track %d: %d chunk(s) from %d frames (chunk_size=%d, stride=%d)",
-            tr["track_id"], len(chunks), N, chunk_size, stride,
+            "Track %d: %d chunk(s) from %d frames (chunk_size=%d, stride=%d, abs_start=%d)",
+            tr["track_id"], len(chunks), N, chunk_size, stride, track_abs_start,
         )
 
         out.append(
@@ -558,6 +582,8 @@ def preprocess_video_tracks_chunked(
                 "total_frames": total_frames,
                 "stability": float(tr.get("stability", 0.0)),
                 "consecutive_miss_max": int(tr.get("consecutive_miss_max", 0)),
+                "track_start_frame": int(tr.get("track_start_frame", 0)),
+                "track_end_frame": int(tr.get("track_end_frame", total_frames - 1)),
             }
         )
 
