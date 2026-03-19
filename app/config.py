@@ -74,6 +74,10 @@ class Settings(BaseModel):
     #   fake_vote_min_windows = 5  →  ignore 1-4 noisy windows (blinks, occlusions)
     fake_vote_gate: float = 0.10
     fake_vote_min_windows: int = 5
+    sqlite_db_url: str = "sqlite:///./jobs.db"
+    run_embedded_worker: bool = True
+    worker_poll_interval_sec: float = 1.0
+    worker_processing_timeout_sec: int = 900
 
 
 def get_settings() -> Settings:
@@ -85,4 +89,6 @@ def get_settings() -> Settings:
     kwargs = {}
     if env_path := os.environ.get("MODEL_PATH"):
         kwargs["model_path"] = Path(env_path)
+    if db_url := os.environ.get("SQLITE_DB_URL"):
+        kwargs["sqlite_db_url"] = db_url
     return Settings(**kwargs)

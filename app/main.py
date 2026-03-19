@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 
+from .api.job_routes import router as job_router
 from .api.routes import router as api_router
 from .core.logger import get_logger
 from .lifecycle import create_start_app_handler, create_stop_app_handler
@@ -17,6 +18,7 @@ def get_application() -> FastAPI:
     )
 
     app.include_router(api_router, prefix="/api")
+    app.include_router(job_router)
 
     @app.get("/", tags=["root"])
     def root():
@@ -26,6 +28,7 @@ def get_application() -> FastAPI:
             "docs": "/docs",
             "openapi": "/openapi.json",
             "predict": "POST /api/lip-sync with multipart video file",
+            "async_predict": "POST /predict, GET /status/{job_id}, GET /result/{job_id}",
         }
 
     app.add_event_handler("startup", create_start_app_handler(app))
