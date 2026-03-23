@@ -56,16 +56,34 @@ Unlike frame-based detectors, this model analyzes **temporal consistency between
 
 ```mermaid
 flowchart LR
-    A[Input Video] --> B[Face Detection & Mouth Crop]
-    B --> C[3D ResNet Visual Encoder]
-    A --> D[Audio Extraction]
-    D --> E[Log-Mel Spectrogram]
-    E --> F[2D ResNet Audio Encoder]
-    C --> G[Cross Modal Attention]
-    F --> G
-    G --> H[Temporal Transformer]
-    H --> I[Binary Classifier]
-    I --> J[Real / Fake + Confidence Score]
+    V["Video Frames (B,3,T,H,W)"] --> VE["Visual Encoder (3D ResNet)"]
+    A["Audio Spectrogram (B,1,F,T_a)"] --> AE["Audio Encoder (2D ResNet)"]
+
+    VE --> VP["Visual Projection -> v_emb (B,T,256)"]
+    AE --> AP["Audio Projection -> a_emb (B,T,256)"]
+
+    VP --> CMA["Cross-Modal Attention + Gated Fusion"]
+    AP --> CMA
+    CMA --> F["Fused Sequence (B,T,256)"]
+
+    F --> TT["Temporal Transformer (Multi-scale + CLS)"]
+    TT --> CLS["Sync Semantic Feature (B,256)"]
+
+    VE --> AD["Artifact Detector (Raw + Delta + High-Freq)"]
+    CLS --> AD
+    AD --> AF["Artifact Feature (B,128)"]
+
+    CLS --> M["Merge Features (B,384)"]
+    AF --> M
+
+    M --> H["Classification Head (MLP)"]
+    H --> O["Logit / Lip-Sync Authenticity Score"]
+
+    style VE fill:#2a2f3a,stroke:#7aa2ff,color:#fff
+    style AE fill:#2a2f3a,stroke:#7aa2ff,color:#fff
+    style CMA fill:#3a2f4a,stroke:#b38cff,color:#fff
+    style TT fill:#2f3a2f,stroke:#6adf91,color:#fff
+    style AD fill:#4a2f2f,stroke:#ff8a8a,color:#fff
 
 ```
 ---
